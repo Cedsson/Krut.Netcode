@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x # global.json requires >= 9.0.100 and allows roll forward
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'global.json') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Restore
+        run: dotnet restore Krut.Netcode.slnx
+
+      - name: Build
+        run: dotnet build Krut.Netcode.slnx -c Release --no-restore -warnaserror
+
+      - name: Build benchmarks (compile only)
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet build benchmarks/Krut.Netcode.Benchmarks -c Release --no-restore -warnaserror
+
+      - name: Test
+        run: dotnet test Krut.Netcode.slnx -c Release --no-build --logger "trx;LogFileName=test-results.trx" --results-directory TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}
+          path: TestResults/*.trx
+          if-no-files-found: warn
+
+      - name: Run prediction demo
+        run: dotnet run --project samples/PredictionDemo -c Release --no-build
+
+      - name: Pack
+        if: matrix.os == 'ubuntu-latest'
+        run: dotnet pack src/Krut.Netcode/Krut.Netcode.csproj -c Release --no-build -o artifacts
+
+      - name: Upload package
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          if-no-files-found: error
+
+  aot:
+    name: Native AOT compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x # global.json requires >= 9.0.100 and allows roll forward
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-aot-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'global.json') }}
+          restore-keys: nuget-aot-${{ runner.os }}-
+
+      - name: Install AOT toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang zlib1g-dev
+
+      - name: Publish demo with Native AOT (trim and AOT warnings are errors)
+        shell: bash
+        run: |
+          dotnet publish samples/PredictionDemo -c Release -r linux-x64 \
+            -p:PublishAot=true \
+            -p:TreatWarningsAsErrors=true \
+            -o aot-out
+
+      - name: Run the AOT binary
+        shell: bash
+        run: |
+          if [ ! -f aot-out/PredictionDemo ]; then
+            echo "::error::aot-out/PredictionDemo was not produced"
+            exit 1
+          fi
+          ./aot-out/PredictionDemo

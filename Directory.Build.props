@@ -1,0 +1,26 @@
+<Project>
+
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <Authors>William Eklund</Authors>
+    <Company>William Eklund</Company>
+    <Product>Krut.Netcode</Product>
+    <Copyright>Copyright (c) 2026 William Eklund</Copyright>
+    <RepositoryUrl>https://github.com/Cedsson/Krut.Netcode</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/Cedsson/Krut.Netcode</PackageProjectUrl>
+  </PropertyGroup>
+
+  <!-- CI: reproducible builds and warnings are errors. -->
+  <PropertyGroup Condition="'$(ContinuousIntegrationBuild)' == 'true' Or '$(GITHUB_ACTIONS)' == 'true'">
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>
