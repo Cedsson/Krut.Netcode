@@ -93,7 +93,9 @@ namespace Krut.Netcode.Tests
 
                 Environment.SetEnvironmentVariable(NetworkSimulation.LatencyVariable, "150");
                 Environment.SetEnvironmentVariable(NetworkSimulation.LossVariable, "0,02");
-                var comma = NetworkSimulation.FromEnvironment();
+                // A Swedish decimal comma: the environment reader parses in the current culture, so set sv-SE here.
+                NetworkSimulation comma = default!;
+                WithCulture("sv-SE", () => comma = NetworkSimulation.FromEnvironment());
                 Require(comma.LatencyMs == 150, "\"150\" was not read as 150",
                     comma.LatencyMs.ToString(CultureInfo.InvariantCulture));
                 Require(MathF.Abs(comma.LossChance - 0.02f) < 0.0001f,
@@ -274,13 +276,7 @@ namespace Krut.Netcode.Tests
                 SendChat(client, "resent " + i);
 
             // Past the plain latency but well before the resend (3 x 200 ms) - in WALL time.
-            var plain = Stopwatch.StartNew();
-            while (plain.ElapsedMilliseconds < 350)
-            {
-                server.Update(1f / 120f);
-                client.Update(1f / 120f);
-                Thread.Sleep(1);
-            }
+            Pump(0.35f, server, client);
             Require(received.Count == 0, "A dropped reliable message arrived without the resend delay",
                 string.Join(", ", received));
 

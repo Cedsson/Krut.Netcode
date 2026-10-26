@@ -66,6 +66,9 @@ namespace Krut.Netcode.Tests
             Require(client.Connect("127.0.0.1", port, "Tester"), "The client could not connect");
             Require(WaitUntilReady(5f, client, server, client), "The client never became ready");
 
+            // Each round advances the sessions by the real time it took, as the wall-clock pumps do.
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            double lastRound = 0;
             void Round()
             {
                 var ping = NetworkSession.Rent<PingMessage>();
@@ -73,8 +76,11 @@ namespace Krut.Netcode.Tests
                 ping.B = 7;
                 client.Send(client.ServerPeerId, ping);
                 client.Flush();
-                client.Update(0.001f);
-                server.Update(0.001f);
+                double now = clock.Elapsed.TotalSeconds;
+                float dt = (float)Math.Min(now - lastRound, 0.1);
+                lastRound = now;
+                client.Update(dt);
+                server.Update(dt);
                 System.Threading.Thread.Sleep(0);
             }
 

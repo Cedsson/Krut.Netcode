@@ -24,35 +24,54 @@ namespace Krut.Netcode.Tests
     /// </summary>
     internal static class NetworkTestSupport
     {
-        /// <summary>Runs one frame of the network.</summary>
-        internal static void Pump(float seconds, params NetworkSession[] sessions)
+        /// <summary>
+        /// Runs the sessions for <paramref name="seconds"/> of wall-clock time. LiteNetLib's timeouts, pings and
+        /// resends are measured against the real clock, so the loop must not count iterations as seconds.
+        /// </summary>
+        internal static void Pump(float seconds, params NetworkSession[] sessions) => PumpUntil(seconds, () => false, sessions);
+
+        /// <summary>Pumps until <paramref name="until"/> is true or <paramref name="seconds"/> of wall-clock time have passed.</summary>
+        internal static bool PumpUntil(float seconds, Func<bool> until, params NetworkSession[] sessions)
         {
-            const float step = 1f / 120f;
-            for (float t = 0; t < seconds; t += step)
+            // A long stall (debugger, loaded CI runner) is passed on as at most this much time, so that a session
+            // never sees one huge step.
+            const double maxStep = 0.1;
+            var clock = Stopwatch.StartNew();
+            double last = 0;
+            while (true)
             {
+                double now = clock.Elapsed.TotalSeconds;
+                float dt = (float)Math.Min(now - last, maxStep);
+                last = now;
                 foreach (var session in sessions)
-                    session.Update(step);
+                    session.Update(dt);
+
+                if (until())
+                    return true;
+                if (now >= seconds)
+                    return false;
 
                 Thread.Sleep(1);
             }
         }
 
-        /// <summary>Pumps until <paramref name="until"/> is true or the time runs out.</summary>
-        internal static bool PumpUntil(float seconds, Func<bool> until, params NetworkSession[] sessions)
+        /// <summary>Runs <paramref name="action"/> with the given current culture, then restores the thread's culture.</summary>
+        internal static void WithCulture(string cultureName, Action action)
         {
-            const float step = 1f / 120f;
-            for (float t = 0; t < seconds; t += step)
+            var previous = CultureInfo.CurrentCulture;
+            var previousUi = CultureInfo.CurrentUICulture;
+            try
             {
-                foreach (var session in sessions)
-                    session.Update(step);
-
-                if (until())
-                    return true;
-
-                Thread.Sleep(1);
+                var culture = new CultureInfo(cultureName);
+                CultureInfo.CurrentCulture = culture;
+                CultureInfo.CurrentUICulture = culture;
+                action();
             }
-
-            return until();
+            finally
+            {
+                CultureInfo.CurrentCulture = previous;
+                CultureInfo.CurrentUICulture = previousUi;
+            }
         }
 
         /// <summary>

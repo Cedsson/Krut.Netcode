@@ -391,7 +391,8 @@ namespace Krut.Netcode.Tests
         {
             WithEnvironment(() =>
             {
-                var sim = NetworkSimulation.FromEnvironment();
+                NetworkSimulation sim = default!;
+                WithCulture("sv-SE", () => sim = NetworkSimulation.FromEnvironment());
                 Require(sim.LatencyMs == 150 && sim.JitterMs == 30 && Math.Abs(sim.LossChance - 0.02f) < 1e-6f, "legacy", sim.Describe());
                 Require(sim.Describe() == "150 ms latency, 30 ms jitter, 2 % loss", "describe format", sim.Describe());
             },
