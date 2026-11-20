@@ -75,6 +75,20 @@ namespace Krut.Netcode
         NetworkDelivery Delivery { get; }
 
         /// <summary>
+        /// Which LiteNetLib channel this message travels on (defaults to <see cref="NetworkChannels.For"/>).
+        /// Override to route high-frequency inputs to <see cref="NetworkChannels.Input"/> or handshake/sync
+        /// traffic to <see cref="NetworkChannels.Control"/>.
+        /// </summary>
+        byte Channel => NetworkChannels.For(Delivery);
+
+        /// <summary>
+        /// Resets fields and clears references before returning the instance to <see cref="NetworkMessagePool{T}"/>.
+        /// Override on pooled game messages carrying strings or optional state to prevent stale data from leaking
+        /// across reuses.
+        /// </summary>
+        void Reset() { }
+
+        /// <summary>
         /// The byte key in the protocol for a message a GAME has registered,
         /// i.e. when <see cref="Type"/> is
         /// <see cref="NetworkMessageType.None"/>. built-in messages use the

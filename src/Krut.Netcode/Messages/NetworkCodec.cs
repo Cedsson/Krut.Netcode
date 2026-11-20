@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using LiteNetLib.Utils;
 using System.Numerics;
 
@@ -55,36 +56,94 @@ namespace Krut.Netcode
         public static void WriteName(NetDataWriter writer, string name) => writer.Put(name ?? string.Empty, MaxNameLength);
 
         /// <summary>Reads a name and sanitizes it (empty/whitespace becomes "Player").</summary>
-        public static string ReadName(NetDataReader reader) => SanitizeName(reader.GetString());
+        public static string ReadName(NetDataReader reader) => SanitizeName(reader.GetString(MaxNameLength * 8));
 
         /// <summary>Writes a text (truncated to <see cref="MaxTextLength"/> characters).</summary>
         public static void WriteText(NetDataWriter writer, string text) => writer.Put(text ?? string.Empty, MaxTextLength);
 
+        /// <summary>Reads text with a bounded length and removes dangerous control and format characters.</summary>
+        public static string ReadText(NetDataReader reader) => SanitizeText(reader.GetString(MaxTextLength * 4));
+
         /// <summary>
-        /// Makes a name usable: cuts it, removes control characters and empty spaces. Called on both sides
-        /// (handshake and lobby) so that the name in the UI can never destroy the layout. LiteNetLib writes a
-        /// string as a 7-bit encoded length followed by the UTF-8 bytes, and
-        /// <see cref="WriteName"/>/<see cref="WriteText"/> pass the maximum as a cap on the encoded byte count.
-        /// A fixed-width 32-character name would need a separate length byte anyway (short names are the common
-        /// case), it would have to pad, and truncating at a fixed byte count can split a multi-byte character
-        /// in half. A length prefix with a byte cap has none of those problems and costs one or two extra
-        /// bytes. Cost. One <c>char[32]</c> allocation per call - 64 bytes on the managed heap.
+        /// Sanitizes text received over the wire: strips control characters other than newline and removes Unicode
+        /// format/bidirectional override characters while capping length at <see cref="MaxTextLength"/> without
+        /// splitting UTF-16 surrogate pairs.
+        /// </summary>
+        public static string SanitizeText(string? text)
+        {
+            if (string.IsNullOrEmpty(text))
+                return string.Empty;
+
+            Span<char> buffer = stackalloc char[MaxTextLength];
+            int count = 0;
+            foreach (char raw in text)
+            {
+                if (count == MaxTextLength)
+                    break;
+
+                if (raw == '\n')
+                {
+                    buffer[count++] = '\n';
+                    continue;
+                }
+
+                if (raw == '\r')
+                    continue;
+
+                if (raw == '\t')
+                {
+                    buffer[count++] = ' ';
+                    continue;
+                }
+
+                UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(raw);
+                if (category == UnicodeCategory.Format)
+                    continue;
+
+                if (category is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator)
+                {
+                    buffer[count++] = '\n';
+                    continue;
+                }
+
+                if (char.IsControl(raw))
+                    continue;
+
+                buffer[count++] = raw;
+            }
+
+            if (count > 0 && char.IsHighSurrogate(buffer[count - 1]))
+                count--;
+
+            return count <= 0 ? string.Empty : new string(buffer.Slice(0, count));
+        }
+
+        /// <summary>
+        /// Makes a name usable: cuts it, removes control and format characters and collapses whitespace. Called on
+        /// both sides (handshake and lobby) so that the name in the UI can never distort the layout.
         /// </summary>
         public static string SanitizeName(string? name)
         {
             if (string.IsNullOrWhiteSpace(name))
                 return "Player";
 
-            char[] buffer = new char[MaxNameLength];
+            Span<char> buffer = stackalloc char[MaxNameLength];
             int count = 0;
             bool lastWasSpace = false;
             foreach (char raw in name)
             {
                 if (count == MaxNameLength)
                     break;
-                // Control characters (null, tab, newline ...) are removed - they could destroy both the
-                // console's line breaks and the name in the UI.
-                char c = char.IsControl(raw) ? ' ' : raw;
+
+                UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(raw);
+                if (category == UnicodeCategory.Format)
+                    continue;
+
+                // Control characters (null, tab, newline ...) and line/paragraph separators are turned into spaces
+                // so they cannot break logs, console lines, or UI layout.
+                char c = char.IsControl(raw) || category is UnicodeCategory.LineSeparator or UnicodeCategory.ParagraphSeparator
+                    ? ' '
+                    : raw;
                 if (c == ' ')
                 {
                     // Double spaces are removed, and a space at the start is skipped entirely (otherwise the
@@ -101,14 +160,14 @@ namespace Krut.Netcode
                 buffer[count++] = c;
             }
 
-            // The space that ends the name is never written out - it shows up as an extra character in a name
-            // list and becomes part of a file key or a hash value somewhere downstream. At most ONE space can
-            // end up last: the loop above sets lastWasSpace, but moves on as soon as something other than a
-            // space is written, and that single-run compression means two can never end up next to each other.
-            if (lastWasSpace)
+            if (count > 0 && char.IsHighSurrogate(buffer[count - 1]))
                 count--;
 
-            return count <= 0 ? "Player" : new string(buffer, 0, count);
+            // Never leave a trailing space (and removing an unpaired high surrogate could expose one).
+            if (count > 0 && buffer[count - 1] == ' ')
+                count--;
+
+            return count <= 0 ? "Player" : new string(buffer.Slice(0, count));
         }
 
         /// <summary>
@@ -125,8 +184,11 @@ namespace Krut.Netcode
             writer.Put(value.Z);
         }
 
-        /// <summary>Reads a vector as <see cref="WriteVector"/> wrote it.</summary>
-        public static Vector3 ReadVector(NetDataReader reader) => new(reader.GetFloat(), reader.GetFloat(), reader.GetFloat());
+        /// <summary>Reads a vector as <see cref="WriteVector"/> wrote it, replacing non-finite values with 0.</summary>
+        public static Vector3 ReadVector(NetDataReader reader) => new(
+            SanitizeFloat(reader.GetFloat()),
+            SanitizeFloat(reader.GetFloat()),
+            SanitizeFloat(reader.GetFloat()));
 
         /// <summary>
         /// Quantizes a position to three shorts within <paramref name="extent"/> (see
@@ -134,7 +196,7 @@ namespace Krut.Netcode
         /// </summary>
         public static void WritePosition(NetDataWriter writer, Vector3 value, float extent = DefaultPositionExtent)
         {
-            if (extent <= 0f)
+            if (!float.IsFinite(extent) || extent <= 0f)
                 extent = DefaultPositionExtent;
 
             writer.Put(QuantizeScaled(value.X, extent));
@@ -149,7 +211,7 @@ namespace Krut.Netcode
         /// </summary>
         public static Vector3 ReadPosition(NetDataReader reader, float extent = DefaultPositionExtent)
         {
-            if (extent <= 0f)
+            if (!float.IsFinite(extent) || extent <= 0f)
                 extent = DefaultPositionExtent;
 
             return new Vector3(DequantizeScaled(reader.GetShort(), extent), DequantizeScaled(reader.GetShort(), extent), DequantizeScaled(reader.GetShort(), extent));
@@ -198,14 +260,19 @@ namespace Krut.Netcode
             return lengthSquared > 1e-6f ? value * (1f / MathF.Sqrt(lengthSquared)) : Quaternion.Identity;
         }
 
+        private static float SanitizeFloat(float value) => float.IsFinite(value) ? value : 0f;
+
         /// <summary>
-        /// Unit-scale float to 16 bits. The clamp to <see cref="short.MinValue"/> ..
-        /// <see cref="short.MaxValue"/> is the load-bearing part: a value slightly outside -1..1 is quantized
-        /// to the end of the range (and dequantizes back to almost exactly the limit), while a value outside
-        /// the <see cref="short"/> range would wrap to the opposite sign - a rotation that arrives as its own
-        /// inverse, which is the kind of bug that is very hard to see.
+        /// Unit-scale float to 16 bits. Non-finite values map to 0; values outside -1..1 clamp to the range ends
+        /// instead of wrapping around <see cref="short"/>.
         /// </summary>
-        private static short Quantize(float value) => (short)Math.Clamp((int)MathF.Round(value * short.MaxValue), short.MinValue, short.MaxValue);
+        private static short Quantize(float value)
+        {
+            if (!float.IsFinite(value))
+                return 0;
+
+            return (short)Math.Clamp((int)MathF.Round(value * short.MaxValue), short.MinValue, short.MaxValue);
+        }
 
         /// <summary>16 bits back to a unit-scale float. Asymmetric on purpose: +1 maps to short.MaxValue, so the range is -1 to just under +1.</summary>
         private static float Dequantize(short value) => value / (float)short.MaxValue;

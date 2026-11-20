@@ -16,6 +16,9 @@ namespace Krut.Netcode
         /// <inheritdoc/>
         public NetworkDelivery Delivery => NetworkDelivery.ReliableOrdered;
 
+        /// <inheritdoc/>
+        public byte Channel => NetworkChannels.Control;
+
         /// <summary>The peer id the server assigned the client (fixed for the lifetime of the connection).</summary>
         public int PeerId { get; set; }
 
@@ -27,6 +30,15 @@ namespace Krut.Netcode
 
         /// <summary>The sanitized name the client chose (the server has already rejected empty/too long names).</summary>
         public string PlayerName { get; set; } = "Player";
+
+        /// <inheritdoc/>
+        public void Reset()
+        {
+            PeerId = 0;
+            TickRate = 0;
+            ServerTick = 0;
+            PlayerName = "Player";
+        }
 
         /// <inheritdoc/>
         public void Write(NetDataWriter writer)
@@ -60,10 +72,13 @@ namespace Krut.Netcode
         public string Text { get; set; } = string.Empty;
 
         /// <inheritdoc/>
+        public void Reset() => Text = string.Empty;
+
+        /// <inheritdoc/>
         public void Write(NetDataWriter writer) => NetworkCodec.WriteText(writer, Text);
 
         /// <inheritdoc/>
-        public void Read(NetDataReader reader) => Text = reader.GetString();
+        public void Read(NetDataReader reader) => Text = NetworkCodec.ReadText(reader);
     }
 
     /// <summary>A chat line from a player.</summary>
@@ -79,10 +94,13 @@ namespace Krut.Netcode
         public string Text { get; set; } = string.Empty;
 
         /// <inheritdoc/>
+        public void Reset() => Text = string.Empty;
+
+        /// <inheritdoc/>
         public void Write(NetDataWriter writer) => NetworkCodec.WriteText(writer, Text);
 
         /// <inheritdoc/>
-        public void Read(NetDataReader reader) => Text = reader.GetString();
+        public void Read(NetDataReader reader) => Text = NetworkCodec.ReadText(reader);
     }
 
     /// <summary>
@@ -109,6 +127,14 @@ namespace Krut.Netcode
 
         /// <summary>The server's tick when the connection came up.</summary>
         public int JoinTick { get; set; }
+
+        /// <inheritdoc/>
+        public void Reset()
+        {
+            PeerId = 0;
+            PlayerName = "Player";
+            JoinTick = 0;
+        }
 
         /// <inheritdoc/>
         public void Write(NetDataWriter writer)
@@ -403,6 +429,7 @@ namespace Krut.Netcode
                 if (!RentedOut.Remove(message) || _count >= Capacity)
                     return;
 
+                message.Reset();
                 Items[_count++] = message;
             }
         }
