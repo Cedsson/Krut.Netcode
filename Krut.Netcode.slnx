@@ -17,6 +17,7 @@
     <Project Path="benchmarks/Krut.Netcode.Benchmarks/Krut.Netcode.Benchmarks.csproj" />
   </Folder>
   <Folder Name="/samples/">
+    <Project Path="samples/NatRendezvousServer/NatRendezvousServer.csproj" />
     <Project Path="samples/PredictionDemo/PredictionDemo.csproj" />
   </Folder>
   <Folder Name="/src/">
