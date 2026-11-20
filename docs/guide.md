@@ -264,8 +264,10 @@ used, never the reflection-based `NetSerializer`.
 
 ## Releasing
 
-1. Set the version in your head: `vX.Y.Z` (for example `v0.2.0`; a suffix such as `v0.2.0-beta.1` makes a prerelease).
-2. Tag the commit on `main` and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
-3. The Release workflow builds, tests, packs with the version from the tag, creates a GitHub Release with the `.nupkg` attached, and pushes to nuget.org.
+Releases are automated on push to `main` via `.github/workflows/release.yml` using Conventional Commits and `standard-version` (`.versionrc.json`).
 
-The nuget.org push needs the repository secret `NUGET_API_KEY` (Settings, Secrets and variables, Actions). Without it the push is skipped with a notice and the GitHub Release is still created. Re-running a tag is safe: `--skip-duplicate` ignores a version that is already published.
+1. Write commits using Conventional Commits (`feat:` for minor, `fix:`/`perf:`/`build:`/`refactor:` for patch, `!` or `BREAKING CHANGE` for major). Pull requests are validated by `.github/workflows/commit-lint.yml`.
+2. On push to `main`, `scripts/has-releasable-commits.cjs` checks for releasable commits since the latest tag. If found, `standard-version` bumps `<Version>` in `src/Krut.Netcode/Krut.Netcode.csproj` (via `scripts/version-updater.cjs`), updates `CHANGELOG.md`, commits, and creates tag `vX.Y.Z`.
+3. The workflow builds, runs all tests, packs `.nupkg`/`.snupkg`, pushes the release commit and tag, creates the GitHub Release, and publishes to nuget.org.
+
+The nuget.org push uses NuGet Trusted Publishing (`NuGet/login@v1` via GitHub OIDC `id-token: write`, no long-lived `NUGET_API_KEY` secret required). Configure a Trusted Publishing policy on nuget.org for repository `Cedsson/Krut.Netcode` and workflow `release.yml`, and set the optional repository variable `NUGET_USER` if your NuGet.org username differs from `Cedsson`. Re-running a package version is safe: `--skip-duplicate` ignores a version that is already published.

@@ -10,7 +10,7 @@
 
   <PropertyGroup Label="Package">
     <PackageId>Krut.Netcode</PackageId>
-    <Version>0.1.0</Version>
+    <Version>1.0.0</Version>
     <Description>Authoritative-server netcode for .NET on LiteNetLib: handshake, fixed tick clock, time sync, client prediction and reconciliation, snapshot interpolation and a link simulator.</Description>
     <PackageTags>netcode;multiplayer;networking;gamedev;prediction;reconciliation;litenetlib</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

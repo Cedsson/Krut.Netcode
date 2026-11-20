@@ -134,8 +134,11 @@ outcomes instead of exact durations, and never lower a timeout to make a test fa
 
 ## Releasing
 
-See the Releasing section of [docs/guide.md](docs/guide.md): tag `vX.Y.Z` on `main` and the Release
-workflow builds, tests, packs and publishes.
+See the Releasing section of [docs/guide.md](docs/guide.md): releases are automated on push to
+`main` from Conventional Commits (`feat:`, `fix:`, `perf:`, `build:`, `refactor:`, `BREAKING CHANGE`)
+via `.github/workflows/release.yml` and `standard-version`, which bumps `<Version>` in
+`src/Krut.Netcode/Krut.Netcode.csproj`, updates `CHANGELOG.md`, tags `vX.Y.Z`, creates the GitHub
+Release with `.nupkg`/`.snupkg`, and publishes to nuget.org.
 
 ## Conduct and security
 

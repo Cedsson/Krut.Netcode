@@ -2,10 +2,17 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [ main ]
+
+# Two releases at the same time would both tag the same version, and the second
+# would try to push a tag that already exists.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   DOTNET_NOLOGO: true
@@ -15,51 +22,121 @@ jobs:
   release:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 9.0.x
+    - name: Git config
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Derive version from tag
-        id: ver
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "::error::Tag '$GITHUB_REF_NAME' is not vMAJOR.MINOR.PATCH[-suffix]"
-            exit 1
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '20'
 
-      - name: Restore
-        run: dotnet restore Krut.Netcode.slnx
+    # Pinned to 9.5.0 because of what .versionrc.json uses (packageFiles +
+    # bumpFiles + infile).
+    - name: Install standard-version
+      run: npm install -g standard-version@9.5.0
 
-      - name: Build
-        run: dotnet build Krut.Netcode.slnx -c Release --no-restore -warnaserror -p:Version=${{ steps.ver.outputs.version }}
+    - name: Bump version, changelog and tag
+      id: version
+      run: |
+        LAST_TAG=$(git tag --points-at HEAD --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
 
-      - name: Test
-        run: dotnet test Krut.Netcode.slnx -c Release --no-build
+        if [ -n "$LAST_TAG" ]; then
+          echo "HEAD is already tagged as $LAST_TAG - skipping."
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
 
-      - name: Pack
-        run: dotnet pack src/Krut.Netcode/Krut.Netcode.csproj -c Release --no-build -p:Version=${{ steps.ver.outputs.version }} -o artifacts
+        LAST_RELEASE=$(git tag --merged HEAD --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          PRE=""
-          case "${{ steps.ver.outputs.version }}" in *-*) PRE="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" artifacts/*.nupkg artifacts/*.snupkg \
-            --title "$GITHUB_REF_NAME" --generate-notes $PRE
+        if ! node scripts/has-releasable-commits.cjs "$LAST_RELEASE"; then
+          echo "No releasable changes since ${LAST_RELEASE:-repo-start} - skipping release."
+          echo "release=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
 
-      - name: Push to nuget.org
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
-        run: |
-          if [ -z "$NUGET_API_KEY" ]; then
-            echo "::notice::NUGET_API_KEY secret is not set, skipping nuget.org push"
-            exit 0
-          fi
-          dotnet nuget push "artifacts/*.nupkg" --api-key "$NUGET_API_KEY" \
-            --source https://api.nuget.org/v3/index.json --skip-duplicate
+        if [ -z "$LAST_RELEASE" ]; then
+          standard-version --first-release --no-verify || echo "standard-version exited with code $?"
+        else
+          standard-version --no-verify || echo "standard-version exited with code $?"
+        fi
+
+        TAG=$(git tag --points-at HEAD --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+
+        if [ -z "$TAG" ]; then
+          echo "::error::standard-version created no valid semver tag. See the log above - this is an error, not 'nothing to release'."
+          git reset --hard HEAD
+          git clean -fd
+          exit 1
+        fi
+
+        VERSION=${TAG#v}
+
+        if ! grep -q "<Version>$VERSION</Version>" src/Krut.Netcode/Krut.Netcode.csproj; then
+          echo "::error::csproj is missing <Version>$VERSION</Version> - the tag $TAG and the project have drifted apart."
+          exit 1
+        fi
+
+        echo "Releasing $TAG"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "release=true" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/setup-dotnet@v6
+      if: steps.version.outputs.release == 'true'
+      with:
+        dotnet-version: 9.0.x
+
+    - name: Build, test and pack NuGet package
+      if: steps.version.outputs.release == 'true'
+      run: |
+        dotnet restore Krut.Netcode.slnx
+        dotnet build Krut.Netcode.slnx -c Release --no-restore -warnaserror -p:Version=${{ steps.version.outputs.version }}
+        dotnet test Krut.Netcode.slnx -c Release --no-build
+        dotnet pack src/Krut.Netcode/Krut.Netcode.csproj -c Release --no-build -p:Version=${{ steps.version.outputs.version }} -o artifacts
+
+    - name: Push commit and tag
+      if: steps.version.outputs.release == 'true'
+      run: git push origin main --follow-tags
+
+    - name: Create GitHub Release
+      if: steps.version.outputs.release == 'true'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.version.outputs.tag }}
+        name: Release ${{ steps.version.outputs.tag }}
+        body_path: CHANGELOG.md
+        files: |
+          artifacts/*.nupkg
+          artifacts/*.snupkg
+        draft: false
+        prerelease: false
+
+    - name: Log in to NuGet (Trusted Publishing)
+      if: steps.version.outputs.release == 'true'
+      id: nuget-login
+      uses: NuGet/login@v1
+      continue-on-error: true
+      with:
+        user: ${{ vars.NUGET_USER || 'Cedsson' }}
+
+    - name: Push to nuget.org
+      if: steps.version.outputs.release == 'true'
+      env:
+        NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+      run: |
+        if [ -z "$NUGET_API_KEY" ]; then
+          echo "::warning::NuGet Trusted Publishing OIDC login did not return an API key. Ensure a Trusted Publishing policy is configured on nuget.org for Cedsson/Krut.Netcode (workflow: release.yml), and set repository variable NUGET_USER if your NuGet.org username differs from Cedsson."
+          exit 0
+        fi
+        dotnet nuget push "artifacts/*.nupkg" \
+          --api-key "$NUGET_API_KEY" \
+          --source https://api.nuget.org/v3/index.json \
+          --skip-duplicate

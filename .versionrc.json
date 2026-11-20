@@ -1,0 +1,52 @@
+{
+  "_comment": [
+    "standard-version configuration. Run automatically by .github/workflows/release.yml",
+    "on every push to main. Installed in CI with:",
+    "npm install -g standard-version@9.5.0",
+    "",
+    "packageFiles = where standard-version reads the CURRENT version from. bumpFiles = where it",
+    "writes the next version to. Here they are the same file, which makes the csproj the single",
+    "source of truth: the tags follow it, not the other way round.",
+    "",
+    "infile/header: standard-version replaces everything above the first '## x.y.z' heading with",
+    "the header - the header must not contain any '## x.y.z' heading itself, that makes",
+    "standard-version refuse to run."
+  ],
+
+  "packageFiles": [
+    {
+      "filename": "src/Krut.Netcode/Krut.Netcode.csproj",
+      "updater": "./scripts/version-updater.cjs"
+    }
+  ],
+
+  "bumpFiles": [
+    {
+      "filename": "src/Krut.Netcode/Krut.Netcode.csproj",
+      "updater": "./scripts/version-updater.cjs"
+    }
+  ],
+
+  "infile": "CHANGELOG.md",
+
+  "header": "# Changelog\n\nAll notable changes to Krut.Netcode are documented in this file.\n\nThe format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n",
+
+  "types": [
+    { "type": "feat", "section": "Features" },
+    { "type": "feature", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "perf", "section": "Performance" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "build", "section": "Build and Dependencies" },
+    { "type": "refactor", "section": "Refactoring" },
+    { "type": "docs", "section": "Documentation", "hidden": true },
+    { "type": "test", "section": "Tests", "hidden": true },
+    { "type": "ci", "section": "CI", "hidden": true },
+    { "type": "chore", "section": "Chores", "hidden": true },
+    { "type": "style", "section": "Styles", "hidden": true }
+  ],
+
+  "tagPrefix": "v",
+
+  "releaseCommitMessageFormat": "chore(release): {{currentTag}}"
+}
