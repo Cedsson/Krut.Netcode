@@ -170,5 +170,134 @@ namespace Krut.Netcode.Tests
             Require(done == 2, "a worker did not finish");
             Require(violations == 0, "two threads held the same instance", violations.ToString());
         }
+
+        private sealed class ConcurrentGameMessageA : INetworkMessage
+        {
+            public const byte Wire = 210;
+            public NetworkMessageType Type => NetworkMessageType.None;
+            public byte WireType => Wire;
+            public NetworkDelivery Delivery => NetworkDelivery.Unreliable;
+            public int Value;
+            public void Reset() => Value = 0;
+            public void Write(NetDataWriter writer) => writer.Put(Value);
+            public void Read(NetDataReader reader) => Value = reader.GetInt();
+        }
+
+        private sealed class ConcurrentGameMessageB : INetworkMessage
+        {
+            public const byte Wire = 211;
+            public NetworkMessageType Type => NetworkMessageType.None;
+            public byte WireType => Wire;
+            public NetworkDelivery Delivery => NetworkDelivery.ReliableOrdered;
+            public int Value;
+            public void Reset() => Value = 0;
+            public void Write(NetDataWriter writer) => writer.Put(Value);
+            public void Read(NetDataReader reader) => Value = reader.GetInt();
+        }
+
+        [Fact]
+        public void IsRegistered_DistinguishesBuiltInReservedAndGameBytes()
+        {
+            Assert.False(NetworkMessages.IsRegistered(0));
+            Assert.True(NetworkMessages.IsRegistered((byte)NetworkMessageType.Welcome));
+            Assert.True(NetworkMessages.IsRegistered((byte)NetworkMessageType.SystemChat));
+            Assert.True(NetworkMessages.IsRegistered((byte)NetworkMessageType.Chat));
+            Assert.True(NetworkMessages.IsRegistered((byte)NetworkMessageType.PlayerInfo));
+            for (byte b = 5; b < NetworkMessages.GameTypeBase; b++)
+                Assert.False(NetworkMessages.IsRegistered(b), $"Reserved unassigned byte {b} should not report as registered");
+
+            Assert.False(NetworkMessages.IsRegistered(215));
+        }
+
+        [Fact]
+        public void Registry_ConcurrentRegistrationAndLookup_IsThreadSafe()
+        {
+            if (!NetworkMessages.IsRegistered(ConcurrentGameMessageA.Wire))
+                NetworkMessages.RegisterGameMessage<ConcurrentGameMessageA>(ConcurrentGameMessageA.Wire, NetworkDelivery.Unreliable);
+            if (!NetworkMessages.IsRegistered(ConcurrentGameMessageB.Wire))
+                NetworkMessages.RegisterGameMessage<ConcurrentGameMessageB>(ConcurrentGameMessageB.Wire, NetworkDelivery.ReliableOrdered);
+
+            var gate = new ManualResetEventSlim(false);
+            int errors = 0;
+
+            void ReaderWorker(byte wire, NetworkDelivery expectedDelivery)
+            {
+                gate.Wait();
+                try
+                {
+                    for (int i = 0; i < 10_000; i++)
+                    {
+                        if (!NetworkMessages.IsRegistered(wire))
+                            Interlocked.Increment(ref errors);
+                        var msg = NetworkMessages.CreateFromWire(wire, out NetworkDelivery? delivery);
+                        if (msg is null || delivery != expectedDelivery)
+                            Interlocked.Increment(ref errors);
+                        NetworkMessages.Recycle(msg, wire);
+                    }
+                }
+                catch
+                {
+                    Interlocked.Increment(ref errors);
+                }
+            }
+
+            void DuplicateRegisterWorker()
+            {
+                gate.Wait();
+                for (int i = 0; i < 500; i++)
+                {
+                    try
+                    {
+                        NetworkMessages.RegisterGameMessage<ConcurrentGameMessageA>(ConcurrentGameMessageA.Wire);
+                        Interlocked.Increment(ref errors);
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        // Expected: duplicate registration must throw without corrupting the table.
+                    }
+                    catch
+                    {
+                        Interlocked.Increment(ref errors);
+                    }
+                }
+            }
+
+            var t1 = new Thread(() => ReaderWorker(ConcurrentGameMessageA.Wire, NetworkDelivery.Unreliable));
+            var t2 = new Thread(() => ReaderWorker(ConcurrentGameMessageB.Wire, NetworkDelivery.ReliableOrdered));
+            var t3 = new Thread(DuplicateRegisterWorker);
+            t1.Start();
+            t2.Start();
+            t3.Start();
+            gate.Set();
+            t1.Join();
+            t2.Join();
+            t3.Join();
+
+            Assert.Equal(0, errors);
+        }
+
+        [Fact]
+        public void Recycle_CallsResetAndIgnoresDoubleReturn()
+        {
+            var msg = NetworkSession.Rent<ChatMessage>();
+            msg.Text = "stale secret";
+
+            NetworkMessages.Recycle(msg);
+            NetworkMessages.Recycle(msg); // double-return must be ignored
+
+            var first = NetworkSession.Rent<ChatMessage>();
+            var second = NetworkSession.Rent<ChatMessage>();
+            try
+            {
+                Assert.Same(msg, first);
+                Assert.Equal(string.Empty, first.Text);
+                Assert.NotSame(first, second);
+            }
+            finally
+            {
+                NetworkMessages.Recycle(first);
+                NetworkMessages.Recycle(second);
+            }
+        }
     }
 }

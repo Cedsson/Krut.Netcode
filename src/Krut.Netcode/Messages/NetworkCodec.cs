@@ -27,28 +27,23 @@ namespace Krut.Netcode
 
         /// <summary>
         /// How large a half extent (world units) the position quantization
-        /// counts from. Tuned for a world in "units" where a player is
-        /// about 64 units long, so 32,000 is enough for tracks a kilometre
-        /// across, and one unit of precision (about 1 cm) is never visible for
-        /// a player in motion.
-        /// The arithmetic, exactly. A position is three
-        /// <see cref="short"/>s, so each axis gets 16 bits over the range
-        /// -<paramref name="extent"/> to +<paramref name="extent"/>:
-        /// 32,000 / 32767 = 0.977 world units per step, and because the
-        /// encoder rounds to the nearest step the worst case - a value that
-        /// lands exactly between two steps - is off by half of that, 0.488
-        /// world units. That is the error bound a consumer may assume, and it
-        /// holds per axis, so the error vector can be at most
-        /// 0.488 * sqrt(3) = 0.85 units long.
-        /// A game with a smaller world should pass its own
-        /// <c>extent</c> to <see cref="WritePosition"/>, which raises the
-        /// resolution in proportion: halving the extent halves the error. A
-        /// value at or below zero is replaced by this default rather than
-        /// throwing, because an extent of zero would divide by zero - and the
-        /// symmetry between <see cref="WritePosition"/> and
-        /// <see cref="ReadPosition"/> means both sides have to agree on it
-        /// anyway, so a wrong value is a bug the test that round-trips a
-        /// position will catch.
+        /// counts from. Tuned for centimeter-scale world units where a player is
+        /// about 64 units long, so 32,000 covers tracks up to ~640 m across at
+        /// ~0.977 units/step (worst-case error ±0.488 units per axis, or up to
+        /// 0.85 units 3D Euclidean).
+        /// <para>
+        /// <b>Meter-scale worlds:</b> if 1 world unit = 1 meter, the default
+        /// extent gives ~49 cm worst-case error per axis, which is too coarse
+        /// for precision movement. Pass a custom <c>extent</c> matching your
+        /// play area (for example <c>500f</c> → ±0.76 cm, <c>2000f</c> → ±3.05 cm),
+        /// or use <see cref="WriteVector"/>/<see cref="ReadVector"/> for full
+        /// 32-bit float precision. Both sender and receiver must pass the exact
+        /// same <c>extent</c> because it is not written to the wire.
+        /// </para>
+        /// <para>
+        /// A non-finite or non-positive <c>extent</c> falls back to this default
+        /// rather than throwing or dividing by zero.
+        /// </para>
         /// </summary>
         public const float DefaultPositionExtent = 32000f;
 
@@ -260,22 +255,49 @@ namespace Krut.Netcode
             return lengthSquared > 1e-6f ? value * (1f / MathF.Sqrt(lengthSquared)) : Quaternion.Identity;
         }
 
+        /// <summary>Reads a 32-bit float and replaces non-finite wire values (<c>NaN</c> or infinity) with <paramref name="fallback"/>.</summary>
+        public static float ReadFiniteFloat(NetDataReader reader, float fallback = 0f)
+        {
+            float value = reader.GetFloat();
+            if (float.IsFinite(value))
+                return value;
+
+            return float.IsFinite(fallback) ? fallback : 0f;
+        }
+
+        /// <summary>
+        /// Reads a 32-bit float, replaces non-finite wire values with <paramref name="fallback"/>, and clamps the
+        /// result into [<paramref name="min"/>, <paramref name="max"/>].
+        /// </summary>
+        public static float ReadClampedFloat(NetDataReader reader, float min, float max, float fallback = 0f)
+        {
+            if (min > max)
+                (min, max) = (max, min);
+
+            float value = ReadFiniteFloat(reader, fallback);
+            return Math.Clamp(value, min, max);
+        }
+
         private static float SanitizeFloat(float value) => float.IsFinite(value) ? value : 0f;
 
         /// <summary>
-        /// Unit-scale float to 16 bits. Non-finite values map to 0; values outside -1..1 clamp to the range ends
-        /// instead of wrapping around <see cref="short"/>.
+        /// Unit-scale float to 16 bits. Non-finite values map to 0; values outside -1..1 clamp to -1..1 before
+        /// scaling so large inputs never overflow <see cref="int"/> and flip sign.
         /// </summary>
         private static short Quantize(float value)
         {
             if (!float.IsFinite(value))
                 return 0;
 
-            return (short)Math.Clamp((int)MathF.Round(value * short.MaxValue), short.MinValue, short.MaxValue);
+            float clamped = Math.Clamp(value, -1f, 1f);
+            return (short)MathF.Round(clamped * short.MaxValue);
         }
 
-        /// <summary>16 bits back to a unit-scale float. Asymmetric on purpose: +1 maps to short.MaxValue, so the range is -1 to just under +1.</summary>
-        private static float Dequantize(short value) => value / (float)short.MaxValue;
+        /// <summary>
+        /// 16 bits back to a symmetric unit-scale float in [-1, +1]; wire <see cref="short.MinValue"/> (-32768)
+        /// clamps to -32767 (-1f) to match the encoder range.
+        /// </summary>
+        private static float Dequantize(short value) => Math.Max((int)value, -short.MaxValue) / (float)short.MaxValue;
 
         /// <summary>Position component: divide by the extent first, so the whole 16-bit range covers the world.</summary>
         private static short QuantizeScaled(float value, float extent) => Quantize(value / extent);

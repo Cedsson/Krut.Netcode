@@ -31,14 +31,14 @@ namespace Krut.Netcode
     /// <b>What the library does NOT do.</b> There is no dispatch the game has
     /// to register into, no per-message size table, no serialization context,
     /// and no partial-read recovery: if <see cref="Read"/> throws, the whole
-    /// message is dropped. Pooling is <i>per type</i> and nothing more - a
-    /// <see cref="NetworkMessagePool{T}"/> is one <c>Stack</c> per concrete
-    /// type, so a game that rents a message must release it through the type
-    /// it rented it as (see <see cref="NetworkMessages.Recycle"/>), and a
-    /// type rented in a loop without being released grows the pool without
-    /// bound. The library owns the pool and hands instances out through
-    /// <see cref="NetworkSession.Rent{T}"/>; it does not know when a game's
-    /// copy is finished.
+    /// message is dropped. Pooling is <i>per type</i> and nothing more — a
+    /// <see cref="NetworkMessagePool{T}"/> keeps up to <see cref="NetworkMessagePool{T}.Capacity"/>
+    /// idle instances and tracks up to 4096 in-flight rented instances so only
+    /// rented instances are recycled (at most once) and <see cref="Reset"/> runs on
+    /// return. Ownership of a rented message transfers to the library on
+    /// <see cref="NetworkSession.Send"/>/<see cref="NetworkSession.Broadcast"/>
+    /// and ends when <see cref="NetworkSession.MessageReceived"/> returns; callers
+    /// must not read or mutate a pooled message after sending or returning from a handler.
     /// </para>
     /// <para>
     /// <b>So here is how a GAME adds a message of its own.</b> The library's

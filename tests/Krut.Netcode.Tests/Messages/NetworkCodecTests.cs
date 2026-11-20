@@ -121,5 +121,78 @@ namespace Krut.Netcode.Tests
             Require(decoded.PlayerName == "Anka", "The name did not survive", decoded.PlayerName);
         }
 
+        [Theory]
+        [InlineData(NetworkCodec.DefaultPositionExtent)]
+        [InlineData(500f)]
+        [InlineData(2000f)]
+        public void Codec_PositionQuantizationError_WithinTheoreticalBound(float extent)
+        {
+            float maxAxisError = ((extent / short.MaxValue) * 0.5f) + 1e-3f;
+            var writer = new NetDataWriter(true, 64);
+
+            for (int i = -20; i <= 20; i++)
+            {
+                float frac = i / 20f;
+                var original = new Vector3(frac * extent, -frac * 0.75f * extent, frac * 0.37f * extent);
+                writer.Reset();
+                NetworkCodec.WritePosition(writer, original, extent);
+                Vector3 decoded = NetworkCodec.ReadPosition(ReaderFor(writer), extent);
+
+                Require(MathF.Abs(decoded.X - original.X) <= maxAxisError, "X error exceeded bound", $"{decoded.X} vs {original.X}");
+                Require(MathF.Abs(decoded.Y - original.Y) <= maxAxisError, "Y error exceeded bound", $"{decoded.Y} vs {original.Y}");
+                Require(MathF.Abs(decoded.Z - original.Z) <= maxAxisError, "Z error exceeded bound", $"{decoded.Z} vs {original.Z}");
+            }
+        }
+
+        [Fact]
+        public void Codec_ExtremePositions_ClampWithCorrectSign_AndMinShortIsSymmetric()
+        {
+            const float extent = 1000f;
+            var writer = new NetDataWriter(true, 64);
+
+            NetworkCodec.WritePosition(writer, new Vector3(1e9f, -1e9f, float.MaxValue), extent);
+            NetworkCodec.WritePosition(writer, new Vector3(float.MinValue, 2e6f, -2e6f), extent);
+            var reader = ReaderFor(writer);
+            Vector3 first = NetworkCodec.ReadPosition(reader, extent);
+            Vector3 second = NetworkCodec.ReadPosition(reader, extent);
+
+            Assert.Equal(extent, first.X, 3);
+            Assert.Equal(-extent, first.Y, 3);
+            Assert.Equal(extent, first.Z, 3);
+            Assert.Equal(-extent, second.X, 3);
+            Assert.Equal(extent, second.Y, 3);
+            Assert.Equal(-extent, second.Z, 3);
+
+            // Raw wire short.MinValue (-32768) clamps symmetrically to -extent.
+            writer.Reset();
+            writer.Put(short.MinValue);
+            writer.Put((short)0);
+            writer.Put(short.MaxValue);
+            Vector3 sym = NetworkCodec.ReadPosition(ReaderFor(writer), extent);
+            Assert.Equal(-extent, sym.X, 3);
+            Assert.Equal(0f, sym.Y, 3);
+            Assert.Equal(extent, sym.Z, 3);
+        }
+
+        [Fact]
+        public void Codec_ReadFiniteFloatAndReadClampedFloat_SanitizeAndClamp()
+        {
+            var writer = new NetDataWriter(true, 64);
+            writer.Put(0.5f);
+            writer.Put(float.NaN);
+            writer.Put(float.PositiveInfinity);
+            writer.Put(float.NegativeInfinity);
+            writer.Put(42f);
+            writer.Put(-42f);
+
+            var reader = ReaderFor(writer);
+            Assert.Equal(0.5f, NetworkCodec.ReadFiniteFloat(reader, -1f));
+            Assert.Equal(-1f, NetworkCodec.ReadFiniteFloat(reader, -1f));
+            Assert.Equal(0f, NetworkCodec.ReadFiniteFloat(reader, float.NaN));
+            Assert.Equal(0f, NetworkCodec.ReadClampedFloat(reader, -1f, 1f));
+            Assert.Equal(1f, NetworkCodec.ReadClampedFloat(reader, 1f, -1f)); // handles swapped min/max
+            Assert.Equal(-1f, NetworkCodec.ReadClampedFloat(reader, -1f, 1f));
+        }
+
     }
 }

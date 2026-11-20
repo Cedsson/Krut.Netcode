@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using LiteNetLib.Utils;
 
 namespace Krut.Netcode
@@ -159,9 +160,11 @@ namespace Krut.Netcode
     /// <para>
     /// Messages are rented from a small pool per type (no allocations per
     /// packet) and handed back as soon as <see cref="NetworkSession"/> has
-    /// processed them. The pools are static, i.e. shared between sessions -
-    /// that is deliberate: a client and a server in the same process (a common
-    /// test setup) then share the same pool at zero extra cost.
+    /// processed them. The pools and game-type registrations are static and
+    /// global per process — that is deliberate: a client and a server in the
+    /// same process (a common test setup) share the same protocol table and
+    /// pools at zero extra cost. Register all game messages once at startup;
+    /// writes are synchronized and wire lookups use lock-free volatile reads.
     /// </para>
     ///
     /// <para>
@@ -206,6 +209,8 @@ namespace Krut.Netcode
     public static class NetworkMessages
     {
 
+        private static readonly object RegistryLock = new();
+
         /// <summary>
         /// Factory and recycler for message types that are NOT part of the library, registered by a game project
         /// (see <see cref="RegisterGameMessage{T}"/>). Indexed by the raw type byte, not by
@@ -234,9 +239,8 @@ namespace Krut.Netcode
         /// Registers a message the game wants to send and receive, with a type byte at or above
         /// <see cref="GameTypeBase"/>. Reading a registered type goes through <see cref="NetworkSession"/>: the
         /// type byte is taken from the packet's first byte, and the message's own type is identified by the
-        /// registered index, not by the enum. The registration is per process and deliberately static, exactly
-        /// like the built-in types' pools: a client and a server in the same process (a common test setup) then
-        /// share the same message code at zero extra cost.
+        /// registered index, not by the enum. The registration is global per process and intended to be called
+        /// at startup, synchronized against concurrent registrations and safely published to lock-free readers.
         /// </summary>
         /// <param name="typeByte">A unique byte in the range 16-255, stable over time - it is wire format.</param>
         public static void RegisterGameMessage<T>(byte typeByte, NetworkDelivery delivery = NetworkDelivery.ReliableOrdered)
@@ -248,28 +252,41 @@ namespace Krut.Netcode
                     $"Bytes below {GameTypeBase} are reserved for the built-in message types.");
             }
 
-            // Two types on one byte would decode into each other without any error: both are valid
-            // INetworkMessage implementations and the fields are read positionally.
-            if (GameFactories[typeByte] is not null)
+            lock (RegistryLock)
             {
-                throw new InvalidOperationException(
-                    $"Type byte {typeByte} is already registered ({typeof(T).Name}). Two types must not share a byte - " +
-                    "a message would be decoded as the wrong type without anything being thrown.");
-            }
+                // Two types on one byte would decode into each other without any error: both are valid
+                // INetworkMessage implementations and the fields are read positionally.
+                if (GameFactories[typeByte] is not null)
+                {
+                    throw new InvalidOperationException(
+                        $"Type byte {typeByte} is already registered ({typeof(T).Name}). Two types must not share a byte - " +
+                        "a message would be decoded as the wrong type without anything being thrown.");
+                }
 
-            // The recycler knows its own T, so it can do the cast; the factory is a closure-free static lambda
-            // so that a burst of packets on one byte allocates no delegates.
-            GameRecyclers[typeByte] = static message => NetworkMessagePool<T>.Recycle((T)message);
-            GameFactories[typeByte] = static () => NetworkMessagePool<T>.Rent();
-            GameDeliveries[typeByte] = delivery;
+                // Publish recycler and delivery before the factory (release write) so lock-free readers see
+                // consistent entries as soon as GameFactories[typeByte] is non-null.
+                GameRecyclers[typeByte] = static message => NetworkMessagePool<T>.Recycle((T)message);
+                GameDeliveries[typeByte] = delivery;
+                Volatile.Write(ref GameFactories[typeByte], static () => NetworkMessagePool<T>.Rent());
+            }
         }
 
         /// <summary>Delivery for a registered game message, or <c>null</c> if the byte isn't registered.</summary>
         private static readonly NetworkDelivery?[] GameDeliveries = new NetworkDelivery?[256];
 
-        /// <summary>Has a game project registered this byte? Used to validate before sending.</summary>
+        /// <summary>Has this wire byte been registered (a built-in message type or a registered game message)?</summary>
         public static bool IsRegistered(byte typeByte)
-            => typeByte < GameTypeBase ? (byte)typeByte > 0 : GameFactories[typeByte] is not null;
+        {
+            if (typeByte < GameTypeBase)
+            {
+                return (NetworkMessageType)typeByte is NetworkMessageType.Welcome
+                    or NetworkMessageType.SystemChat
+                    or NetworkMessageType.Chat
+                    or NetworkMessageType.PlayerInfo;
+            }
+
+            return Volatile.Read(ref GameFactories[typeByte]) is not null;
+        }
 
         /// <summary>
         /// Creates (or rents) an empty message of the given type, or null if the type is unknown. The caller
@@ -302,7 +319,7 @@ namespace Krut.Netcode
             if (typeByte < GameTypeBase)
                 return Create((NetworkMessageType)typeByte);
 
-            var factory = GameFactories[typeByte];
+            var factory = Volatile.Read(ref GameFactories[typeByte]);
             if (factory is null)
                 return null;
 
@@ -316,9 +333,8 @@ namespace Krut.Netcode
         /// apart by <c>typeof</c> (both are just <see cref="INetworkMessage"/>), so without the byte the
         /// instance would have no path back to the right pool. Requiring the caller to pass the byte is cheaper
         /// than guessing - and guessing is exactly the kind of bug that silently leaks memory over a long run.
-        /// <see cref="NetworkMessagePool{T}"/> keeps the same property: the pool never clears a returned
-        /// instance's fields, so a message that was not fully written before being sent would read back the
-        /// previous borrower's values.
+        /// <see cref="NetworkMessagePool{T}.Recycle"/> invokes <see cref="INetworkMessage.Reset"/> before placing
+        /// the instance back into the pool, and callers must not access a message after sending or recycling it.
         /// </summary>
         /// <param name="typeByte">The byte the packet carried, or 0 for built-in types.</param>
         public static void Recycle(INetworkMessage? message, byte typeByte = 0)
@@ -331,7 +347,10 @@ namespace Krut.Netcode
             // and the garbage collector takes it.
             if (typeByte >= GameTypeBase)
             {
-                var gameRecycler = GameRecyclers[typeByte];
+                if (Volatile.Read(ref GameFactories[typeByte]) is null)
+                    return;
+
+                var gameRecycler = Volatile.Read(ref GameRecyclers[typeByte]);
                 if (gameRecycler is not null)
                 {
                     gameRecycler(message);
@@ -369,9 +388,13 @@ namespace Krut.Netcode
         /// </summary>
         public static void ClearGameMessages()
         {
-            Array.Clear(GameFactories);
-            Array.Clear(GameRecyclers);
-            Array.Clear(GameDeliveries);
+            lock (RegistryLock)
+            {
+                for (int i = GameTypeBase; i < GameFactories.Length; i++)
+                    Volatile.Write(ref GameFactories[i], null);
+                Array.Clear(GameRecyclers);
+                Array.Clear(GameDeliveries);
+            }
         }
     }
 
