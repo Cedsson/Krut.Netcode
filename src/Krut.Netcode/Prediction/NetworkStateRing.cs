@@ -158,12 +158,16 @@ namespace Krut.Netcode
             if (index < 0 || index >= Count)
                 throw new ArgumentOutOfRangeException(nameof(index), index, "Index outside the ring.");
 
+            int tick = _tickOf(entry);
+            if ((index > 0 && tick <= TickAt(index - 1)) || (index + 1 < Count && tick >= TickAt(index + 1)))
+                throw new ArgumentException($"Tick {tick} violates strictly ascending order at ring index {index}.", nameof(entry));
+
             int slot = _head + index;
             if (slot >= _entries.Length)
                 slot -= _entries.Length;
 
             _entries[slot] = entry;
-            _ticks[slot] = _tickOf(entry);
+            _ticks[slot] = tick;
         }
 
         /// <summary>
@@ -309,18 +313,25 @@ namespace Krut.Netcode
     /// allocates nothing.
     /// </para>
     /// <para>
-    /// <b>The limitation - and why it's fine:</b> the blending assumes every
-    /// component is 4 bytes. <c>float</c>, <c>int</c>, <c>uint</c> work, because
-    /// each group is treated as a <c>float</c> and written back to the same 4
-    /// bytes. What does <b>not</b> work is a <c>bool</c> (1 byte), an enum or a
-    /// pointer: then the bits move rather than the value. A state with such fields
-    /// must either (a) keep them in a separate struct outside <c>TState</c> -
-    /// which is almost always right anyway, since a <c>bool flags</c> has no
-    /// meaningful "in-between" - or (b) install its own blending function via the
-    /// interpolator's / reconciler's delegate.
+    /// <b>The limitation - and how to handle mixed structs:</b> <see cref="Lerp{TState}"/>,
+    /// <see cref="Extend{TState}"/>, <see cref="Offset{TState}"/> and <see cref="Subtract{TState}"/>
+    /// reinterpret every 4-byte word in <c>TState</c> as an IEEE 754 <c>float</c>.
+    /// They are therefore valid <b>only</b> for structs composed exclusively of 32-bit <c>float</c>
+    /// components (<c>float</c>, <c>Vector2</c>, <c>Vector3</c>, <c>Vector4</c>). An <c>int</c>,
+    /// <c>uint</c>, <c>bool</c>, <c>enum</c>, flag bitfield, ID, or pointer does <b>not</b> convert
+    /// numerically when read as a <c>float</c> — its raw bits are interpreted as a floating-point
+    /// representation (for example, <c>-1</c> becomes <c>NaN</c>), corrupting discrete fields. A state
+    /// with discrete fields or rotations must either (a) keep discrete fields in a separate struct
+    /// outside <c>TState</c> — which is usually cleaner anyway, since flags and IDs
+    /// have no meaningful "in-between" — or (b) install typed custom delegates on
+    /// <see cref="NetworkSnapshotInterpolator{TState}.Lerp"/>,
+    /// <see cref="NetworkSnapshotInterpolator{TState}.Extrapolate"/>,
+    /// <see cref="NetworkReconciler{TState, TInput}.RenderOffset"/>, and
+    /// <see cref="NetworkReconciler{TState, TInput}.DistanceMetric"/> that interpolate only continuous
+    /// fields and use <see cref="SlerpRotation"/> for rotations.
     /// </para>
     /// <para>
-    /// <b>The alignment rule, stated exactly.</b> Every function here walks the
+    /// <b>The alignment rule, stated exactly.</b> Every component-wise function here walks the
     /// state as <c>((float*)ptr)[i]</c> for <c>i</c> in
     /// <c>0 .. sizeof(TState) / 4 - 1</c>: component <c>i</c> is the 4-byte word at
     /// byte offset <c>4 * i</c>. Three things follow:
@@ -334,10 +345,9 @@ namespace Krut.Netcode
     /// <see cref="PositionDistance{TState}"/> treat the first three components as
     /// X/Y/Z, and it is also why a game must not reorder its fields between
     /// versions without rebuilding both sides.</item>
-    /// <item>Each component is read as a <c>float</c> regardless of what it
-    /// actually is. An <c>int</c> field that overflows past 2^24 loses
-    /// precision through the round trip, which is why tick numbers and ids
-    /// normally live outside <c>TState</c> rather than inside it.</item>
+    /// <item>Every 4-byte field is treated as a <c>float</c>. Do not store
+    /// integers, IDs, ticks, enums, or packed flags inside a <c>TState</c>
+    /// that uses the default component-wise functions; supply typed custom delegates instead.</item>
     /// </list>
     /// </para>
     /// <para>
@@ -355,7 +365,7 @@ namespace Krut.Netcode
     /// </summary>
     public static unsafe class NetworkStateBlend
     {
-        /// <summary>Number of bytes per interpolated component (float/int).</summary>
+        /// <summary>Number of bytes per interpolated component (32-bit IEEE 754 float).</summary>
         public const int ComponentSize = sizeof(float);
 
         /// <summary>
@@ -557,34 +567,45 @@ namespace Krut.Netcode
         /// <summary>Shortest-path interpolation of a rotation, with the result normalized.</summary>
         public static Quaternion SlerpRotation(Quaternion from, Quaternion to, float t)
         {
-            t = Math.Clamp(t, 0f, 1f);
+            t = float.IsFinite(t) ? Math.Clamp(t, 0f, 1f) : 0f;
 
-            float lengthSquared = from.LengthSquared();
-            if (lengthSquared <= 1e-12f)
+            float fromLenSq = from.LengthSquared();
+            if (!float.IsFinite(fromLenSq) || fromLenSq <= 1e-12f)
                 return Normalized(to);
 
-            Quaternion a = from * (1f / MathF.Sqrt(lengthSquared));
-            Quaternion b = Normalized(to);
+            Quaternion a = from * (1f / MathF.Sqrt(fromLenSq));
+            float toLenSq = to.LengthSquared();
+            if (!float.IsFinite(toLenSq) || toLenSq <= 1e-12f)
+                return a;
 
-            // -1 makes b into -b, which is the same rotation but gives a positive
-            // dot product, i.e. the shortest way. The 0.9995 limit corresponds to
-            // ~2 degrees, where a plain slerp starts to become numerically
-            // unstable and nlerp is exactly accurate enough.
-            float dot = ((a.X * b.X) + (a.Y * b.Y) + (a.Z * b.Z) + (a.W * b.W));
+            Quaternion b = to * (1f / MathF.Sqrt(toLenSq));
+
+            // Negating b preserves the rotation while flipping dot positive so interpolation always takes the shortest arc.
+            float dot = (a.X * b.X) + (a.Y * b.Y) + (a.Z * b.Z) + (a.W * b.W);
+            if (!float.IsFinite(dot))
+                return Quaternion.Identity;
+
             if (dot < 0f)
+            {
                 b = new Quaternion(-b.X, -b.Y, -b.Z, -b.W);
-            else if (dot > 0.9995f)
-                return Normalized(new Quaternion(
-                    a.X + ((b.X - a.X) * t),
-                    a.Y + ((b.Y - a.Y) * t),
-                    a.Z + ((b.Z - a.Z) * t),
-                    a.W + ((b.W - a.W) * t)));
+                dot = -dot;
+            }
 
-            float theta0 = MathF.Acos(Math.Clamp(dot, -1f, 1f));
+            dot = Math.Clamp(dot, 0f, 1f);
+
+            // 0.9995 (~1.8 deg): plain SLERP divides by sin(theta0) which becomes unstable near zero; NLERP is exact here.
+            if (dot > 0.9995f)
+                return NlerpNormalized(a, b, t);
+
+            float theta0 = MathF.Acos(dot);
             float sinTheta0 = MathF.Sin(theta0);
+            if (sinTheta0 <= 1e-6f)
+                return NlerpNormalized(a, b, t);
+
             float theta = theta0 * t;
-            float s0 = MathF.Cos(theta) - (dot * MathF.Sin(theta) / sinTheta0);
-            float s1 = MathF.Sin(theta) / sinTheta0;
+            float sinTheta = MathF.Sin(theta);
+            float s0 = MathF.Cos(theta) - (dot * sinTheta / sinTheta0);
+            float s1 = sinTheta / sinTheta0;
             return Normalized(new Quaternion(
                 (a.X * s0) + (b.X * s1),
                 (a.Y * s0) + (b.Y * s1),
@@ -592,14 +613,21 @@ namespace Krut.Netcode
                 (a.W * s0) + (b.W * s1)));
         }
 
+        private static Quaternion NlerpNormalized(Quaternion a, Quaternion b, float t) =>
+            Normalized(new Quaternion(
+                a.X + ((b.X - a.X) * t),
+                a.Y + ((b.Y - a.Y) * t),
+                a.Z + ((b.Z - a.Z) * t),
+                a.W + ((b.W - a.W) * t)));
+
         /// <summary>
-        /// Normalizes a quaternion, and returns the identity for a zero quaternion (where the length isn't
-        /// defined).
+        /// Normalizes a quaternion, and returns the identity for a zero or non-finite quaternion (where the length
+        /// isn't defined).
         /// </summary>
         public static Quaternion Normalized(Quaternion value)
         {
             float lengthSquared = value.LengthSquared();
-            if (lengthSquared <= 1e-6f)
+            if (!float.IsFinite(lengthSquared) || lengthSquared <= 1e-6f)
                 return Quaternion.Identity;
 
             float scale = 1f / MathF.Sqrt(lengthSquared);

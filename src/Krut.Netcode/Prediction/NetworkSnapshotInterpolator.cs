@@ -185,11 +185,22 @@ namespace Krut.Netcode
         /// <returns>The render tick, i.e. <c>currentTick - DelayTicks</c>. Unit: ticks.</returns>
         public int RenderTickFor(int currentTick) => currentTick - DelayTicks;
 
+        private Func<TState, TState, float, TState> _lerp = NetworkStateBlend.Lerp<TState>;
+        private Func<TState, TState, float, TState> _extrapolate = NetworkStateBlend.Extend<TState>;
+
         /// <summary>The function that blends two states.</summary>
-        public Func<TState, TState, float, TState> Lerp { get; set; } = NetworkStateBlend.Lerp<TState>;
+        public Func<TState, TState, float, TState> Lerp
+        {
+            get => _lerp;
+            set => _lerp = value ?? throw new ArgumentNullException(nameof(value));
+        }
 
         /// <summary>The function that guesses a state forwards.</summary>
-        public Func<TState, TState, float, TState> Extrapolate { get; set; } = NetworkStateBlend.Extend<TState>;
+        public Func<TState, TState, float, TState> Extrapolate
+        {
+            get => _extrapolate;
+            set => _extrapolate = value ?? throw new ArgumentNullException(nameof(value));
+        }
 
         /// <summary>Receives a snapshot: the unit's state at exactly <paramref name="tick"/>.</summary>
         /// <param name="tick">
@@ -301,7 +312,8 @@ namespace Krut.Netcode
                 // tickA and tickB. tickB - tickA can be greater than 1 if a snapshot was lost; then the
                 // fraction is less than a tick, which is correct: the line 20->30 gives 150 at tick 25, and
                 // that is what the "lost snapshot" test verifies.
-                float t = (float)(renderTick - lowerTick) / (tickB - lowerTick);
+                double span = (double)tickB - lowerTick;
+                float t = (float)((renderTick - lowerTick) / span);
                 state = Lerp(a, b, t);
                 mode = NetworkSampleMode.Interpolated;
                 LastSampleMode = mode;
@@ -381,7 +393,7 @@ namespace Krut.Netcode
             // alpha is ticks past the NEWEST point; Extrapolate takes a fraction of the previous-to-newest interval
             // (0 = the older, 1 = the newest), so the ticks are divided by the gap between the two snapshots.
             TState previous = _snapshots[previousIndex].Value;
-            int gapTicks = newestTick - _snapshots[previousIndex].Tick;
+            double gapTicks = (double)newestTick - _snapshots[previousIndex].Tick;
             state = Extrapolate(previous, newest, 1f + (float)(alpha / gapTicks));
             mode = NetworkSampleMode.Extrapolated;
             LastSampleMode = mode;

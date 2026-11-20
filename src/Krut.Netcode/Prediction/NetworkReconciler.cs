@@ -330,6 +330,9 @@ namespace Krut.Netcode
         /// <summary>Number of server replies that were ignored (duplicates or old snapshots - see <see cref="Reconcile"/>).</summary>
         public int IgnoredServerStateCount { get; private set; }
 
+        /// <summary>Number of times a server acknowledgement reported a tick strictly greater than <see cref="NewestPendingTick"/> while pending inputs existed.</summary>
+        public int FutureAckCount { get; private set; }
+
         /// <summary>The size of the last correction in <see cref="DistanceMetric"/> units (see <see cref="LastCorrectionDistance"/>).</summary>
         public float LastCorrectionDistance { get; private set; }
 
@@ -348,13 +351,20 @@ namespace Krut.Netcode
         /// <summary>Which tick the history extends to - the tick that was sent last.</summary>
         public int NewestPendingTick => _history.IsEmpty ? -1 : _history[_history.Count - 1].Tick;
 
+        private Func<TState, TState, float> _distanceMetric = NetworkStateBlend.PositionDistance<TState>;
+        private Func<TState, TState, TState, float, TState> _renderOffset = NetworkStateBlend.Offset<TState>;
+
         /// <summary>
         /// How the distance between two states is measured, to decide whether a correction should be slid or
         /// teleported. The default reads the first three components as a position
         /// (<see cref="NetworkStateBlend.PositionDistance{TState}"/>), which fits the library's usual layout
         /// (position first, then rotation/velocity).
         /// </summary>
-        public Func<TState, TState, float> DistanceMetric { get; set; } = NetworkStateBlend.PositionDistance<TState>;
+        public Func<TState, TState, float> DistanceMetric
+        {
+            get => _distanceMetric;
+            set => _distanceMetric = value ?? throw new ArgumentNullException(nameof(value));
+        }
 
         /// <summary>
         /// How a visual correction is laid on top of the running prediction: <c>(predicted, shownAtCorrection,
@@ -366,7 +376,11 @@ namespace Krut.Netcode
         /// quaternions sets its own function that shifts only the visible components - interpreting an
         /// integer's bits as a float gives garbage.
         /// </summary>
-        public Func<TState, TState, TState, float, TState> RenderOffset { get; set; } = NetworkStateBlend.Offset<TState>;
+        public Func<TState, TState, TState, float, TState> RenderOffset
+        {
+            get => _renderOffset;
+            set => _renderOffset = value ?? throw new ArgumentNullException(nameof(value));
+        }
 
         /// <summary>
         /// The function that runs one input against one state. Used by both <see cref="Predict"/> and
@@ -501,6 +515,26 @@ namespace Krut.Netcode
         /// returned.
         /// </para>
         /// <para>
+        /// <b>Ack-tick invariants (contiguous per-tick history):</b>
+        /// </para>
+        /// <list type="bullet">
+        /// <item><c>lastProcessedInputTick == NewestPendingTick</c>: all pending
+        /// inputs were acknowledged; history is cleared without a miss.</item>
+        /// <item><c>lastProcessedInputTick &gt; NewestPendingTick</c>: the server
+        /// acked ahead of local pending history (for example, server clock or
+        /// sparse input stepping); history is cleared, <see cref="FutureAckCount"/>
+        /// increments, and no rollback miss is recorded.</item>
+        /// <item><c>lastProcessedInputTick == OldestPendingTick - 1</c>: zero
+        /// inputs are missing (for example, right after <see cref="Reset"/> or when
+        /// an input was dropped and the server repeats its previous ack); all
+        /// pending inputs are replayed and kept without a miss.</item>
+        /// <item><c>lastProcessedInputTick &lt; OldestPendingTick - 1</c> or an
+        /// internal tick gap inside history: the rollback target is lost or
+        /// non-contiguous, so <see cref="RollbackMissCount"/> increments, history
+        /// is cleared, and the authoritative state is adopted so prediction
+        /// recovers cleanly on subsequent ticks.</item>
+        /// </list>
+        /// <para>
         /// <b>Three things are aborted here, for different reasons:</b>
         /// </para>
         /// <list type="bullet">
@@ -604,33 +638,56 @@ namespace Krut.Netcode
                 return 0;
             }
 
-            // Everything acknowledged? Then the server's state is the whole truth.
-            if (_history.IsEmpty || lastProcessedInputTick >= NewestPendingTick)
+            if (_history.IsEmpty)
             {
+                ApplyCorrection(_authoritative);
+                return 0;
+            }
+
+            // Everything acknowledged (or server acked ahead of local history)? Then the server's state is the truth.
+            int newestPending = NewestPendingTick;
+            if (lastProcessedInputTick >= newestPending)
+            {
+                if (lastProcessedInputTick > newestPending)
+                    FutureAckCount++;
+
                 _history.Clear();
                 ApplyCorrection(_authoritative);
                 return 0;
             }
 
-            int target = _history.IndexOfTickAtOrBefore(lastProcessedInputTick);
-            if (target < 0 || _history[target].Tick != lastProcessedInputTick)
+            int oldestPending = OldestPendingTick;
+            int replayStartIndex;
+            if (oldestPending > int.MinValue && lastProcessedInputTick == oldestPending - 1)
             {
-                // The server skipped past everything we have saved (we were far ahead and already had to drop
-                // inputs, or the server's lastProcessedInputTick isn't a tick we ever sent).
-                RollbackMissCount++;
-                _history.Clear();
-                ApplyCorrection(_authoritative);
-                return 0;
+                // No inputs are missing between lastProcessedInputTick and OldestPendingTick:
+                // replay every stored pending input starting at index 0.
+                replayStartIndex = 0;
+            }
+            else
+            {
+                int target = _history.IndexOfTickAtOrBefore(lastProcessedInputTick);
+                if (target < 0 || _history[target].Tick != lastProcessedInputTick)
+                {
+                    // Either lastProcessedInputTick fell behind OldestPendingTick - 1 (inputs were dropped on buffer
+                    // overflow) or there is a gap inside history (non-contiguous ticks cannot be replayed sequentially).
+                    RollbackMissCount++;
+                    _history.Clear();
+                    ApplyCorrection(_authoritative);
+                    return 0;
+                }
+
+                replayStartIndex = target + 1;
             }
 
             // Collect every unacknowledged input after the server's last processed tick, in ascending tick
             // order.
-            int count = _history.Count - target - 1;
+            int count = _history.Count - replayStartIndex;
             if (count > _replayScratch.Length)
                 count = _replayScratch.Length;
 
             for (int i = 0; i < count; i++)
-                _replayScratch[i] = _history[target + 1 + i].Input;
+                _replayScratch[i] = _history[replayStartIndex + i].Input;
 
             TState corrected;
             PendingReplayCount = count;
@@ -714,6 +771,7 @@ namespace Krut.Netcode
             _history.Clear();
             DroppedInputCount = 0;
             RollbackMissCount = 0;
+            FutureAckCount = 0;
             _authoritative = state;
             AuthoritativeTick = serverTick;
             _lastReconciledServerTick = serverTick;
