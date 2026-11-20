@@ -4,6 +4,23 @@ All notable changes to Krut.Netcode are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0](https://github.com/Cedsson/Krut.Netcode/compare/v1.0.2...v1.1.0) (2026-11-20)
+
+
+### Features
+
+* **nat:** add NativeAOT-safe binary NAT punchthrough and rendezvous server ([347d188](https://github.com/Cedsson/Krut.Netcode/commit/347d188fdb0ab5b4df71f8532b49d9caeec13c1a))
+* **security:** add AES-256-GCM datagram and ephemeral ECDH session encryption ([8baed80](https://github.com/Cedsson/Krut.Netcode/commit/8baed809c7acb05db055d7c244594ba2ab761d4b))
+
+
+### Bug Fixes
+
+* **messages:** harden codec quantization, finite reads, and thread-safe registry ([17aca3c](https://github.com/Cedsson/Krut.Netcode/commit/17aca3ca565dab6295c8d43dbd42ece37d3e0b8e))
+* **prediction:** fix slerp flip, tick-span math, and reconciler rollback edge cases ([de9325f](https://github.com/Cedsson/Krut.Netcode/commit/de9325fc7f97e4801c223a0a4982698e886b9484))
+* **session:** bound inbound queues, isolate callbacks, and harden socket lifecycle ([fcb4809](https://github.com/Cedsson/Krut.Netcode/commit/fcb48091e3b3c0d5ea62f108087f9e1635446e04))
+* **simulation:** bound delay queue, synchronize link stats, and guard invalid inputs ([5f26cfb](https://github.com/Cedsson/Krut.Netcode/commit/5f26cfb0ffca9426692e4b72fb1c134f9750bfcb))
+* **time:** add clock clamp telemetry and harden time sync bounds ([0bf6b90](https://github.com/Cedsson/Krut.Netcode/commit/0bf6b90dc51d1015ecec6158eb22fca43ccb7717))
+
 ### [1.0.2](https://github.com/Cedsson/Krut.Netcode/compare/v1.0.1...v1.0.2) (2026-11-20)
 
 
