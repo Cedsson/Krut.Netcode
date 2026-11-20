@@ -392,6 +392,9 @@ namespace Krut.Netcode
 
         private static readonly T?[] Items = new T?[Capacity];
         private static readonly HashSet<T> RentedOut = new(ReferenceEqualityComparer.Instance);
+        private static readonly T?[] TrackedRing = new T?[MaxTracked];
+        private static T? _lastRented;
+        private static int _trackedHead;
         private static int _count;
 
         /// <summary>Takes an instance out of the pool, or creates a new one if the pool is empty. The caller owns it until it is sent or recycled.</summary>
@@ -410,15 +413,22 @@ namespace Krut.Netcode
                     message = new T();
                 }
 
-                if (RentedOut.Count >= MaxTracked)
-                    RentedOut.Clear();
-                RentedOut.Add(message);
+                // Fast path: when only one instance of T is in flight at a time, track it in _lastRented
+                // without touching the HashSet.
+                if (_lastRented is null)
+                {
+                    _lastRented = message;
+                    return message;
+                }
+
+                TrackInSet(_lastRented);
+                _lastRented = message;
                 return message;
             }
         }
 
         /// <summary>
-        /// Puts a rented instance back (does not clear the fields - they are overwritten next time). Ignored when
+        /// Puts a rented instance back (calls <see cref="INetworkMessage.Reset"/> before pooling). Ignored when
         /// the instance was not rented from this pool or was already recycled. The caller must not touch the
         /// instance afterwards.
         /// </summary>
@@ -426,12 +436,33 @@ namespace Krut.Netcode
         {
             lock (Items)
             {
-                if (!RentedOut.Remove(message) || _count >= Capacity)
+                if (ReferenceEquals(_lastRented, message))
+                {
+                    _lastRented = null;
+                }
+                else if (!RentedOut.Remove(message))
+                {
                     return;
+                }
 
                 message.Reset();
-                Items[_count++] = message;
+                if (_count < Capacity)
+                    Items[_count++] = message;
             }
+        }
+
+        private static void TrackInSet(T instance)
+        {
+            if (RentedOut.Count >= MaxTracked)
+            {
+                T? oldest = TrackedRing[_trackedHead];
+                if (oldest is not null && !ReferenceEquals(oldest, instance))
+                    RentedOut.Remove(oldest);
+            }
+
+            TrackedRing[_trackedHead] = instance;
+            _trackedHead = (_trackedHead + 1) & (MaxTracked - 1);
+            RentedOut.Add(instance);
         }
     }
 }

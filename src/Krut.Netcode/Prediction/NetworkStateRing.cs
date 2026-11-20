@@ -1,6 +1,7 @@
 using System;
-using System.Runtime.CompilerServices;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 namespace Krut.Netcode
 {
@@ -276,6 +277,15 @@ namespace Krut.Netcode
             return result;
         }
 
+        /// <summary>Returns the tick at position <paramref name="index"/> (0 = oldest) without copying <typeparamref name="TEntry"/>.</summary>
+        public int GetTick(int index)
+        {
+            if (index < 0 || index >= Count)
+                throw new ArgumentOutOfRangeException(nameof(index), index, "Index outside the ring.");
+
+            return TickAt(index);
+        }
+
         private int TickAt(int index)
         {
             int slot = _head + index;
@@ -404,18 +414,29 @@ namespace Krut.Netcode
                     nameof(from));
             }
 
-            // The pointers are validated here instead of on every iteration: the check is cheap, the loop's
-            // isn't - and the outside-the-loop version is what lets the JIT/AOT keep both ends in registers.
-            TState* fromPtr = &from;
-            TState* toPtr = &to;
+            float* fromFloats = (float*)&from;
+            float* toFloats = (float*)&to;
             TState result = default;
-            TState* resultPtr = &result;
+            float* resultFloats = (float*)&result;
 
-            for (int i = 0; i < components; i++)
+            int i = 0;
+            if (Vector128.IsHardwareAccelerated && components >= Vector128<float>.Count)
             {
-                float a = ((float*)fromPtr)[i];
-                float b = ((float*)toPtr)[i];
-                ((float*)resultPtr)[i] = a + ((b - a) * t);
+                Vector128<float> vt = Vector128.Create(t);
+                int simdLimit = components - Vector128<float>.Count;
+                for (; i <= simdLimit; i += Vector128<float>.Count)
+                {
+                    Vector128<float> va = Vector128.Load(fromFloats + i);
+                    Vector128<float> vb = Vector128.Load(toFloats + i);
+                    (va + ((vb - va) * vt)).Store(resultFloats + i);
+                }
+            }
+
+            for (; i < components; i++)
+            {
+                float a = fromFloats[i];
+                float b = toFloats[i];
+                resultFloats[i] = a + ((b - a) * t);
             }
 
             return result;
@@ -445,16 +466,30 @@ namespace Krut.Netcode
             if (components * ComponentSize != sizeof(TState))
                 throw new ArgumentException($"TState {typeof(TState).Name} cannot be handled component-wise.", nameof(state));
 
-            TState* statePtr = &state;
-            TState* fromPtr = &from;
-            TState* toPtr = &to;
+            float* stateFloats = (float*)&state;
+            float* fromFloats = (float*)&from;
+            float* toFloats = (float*)&to;
             TState result = default;
-            TState* resultPtr = &result;
+            float* resultFloats = (float*)&result;
 
-            for (int i = 0; i < components; i++)
+            int i = 0;
+            if (Vector128.IsHardwareAccelerated && components >= Vector128<float>.Count)
             {
-                float error = ((float*)fromPtr)[i] - ((float*)toPtr)[i];
-                ((float*)resultPtr)[i] = ((float*)statePtr)[i] + (error * share);
+                Vector128<float> vShare = Vector128.Create(share);
+                int simdLimit = components - Vector128<float>.Count;
+                for (; i <= simdLimit; i += Vector128<float>.Count)
+                {
+                    Vector128<float> vs = Vector128.Load(stateFloats + i);
+                    Vector128<float> vf = Vector128.Load(fromFloats + i);
+                    Vector128<float> vt = Vector128.Load(toFloats + i);
+                    (vs + ((vf - vt) * vShare)).Store(resultFloats + i);
+                }
+            }
+
+            for (; i < components; i++)
+            {
+                float error = fromFloats[i] - toFloats[i];
+                resultFloats[i] = stateFloats[i] + (error * share);
             }
 
             return result;
@@ -470,14 +505,26 @@ namespace Krut.Netcode
             if (components * ComponentSize != sizeof(TState))
                 throw new ArgumentException($"TState {typeof(TState).Name} cannot be handled component-wise.", nameof(a));
 
-            TState* aPtr = &a;
-            TState* bPtr = &b;
+            float* aFloats = (float*)&a;
+            float* bFloats = (float*)&b;
             TState result = default;
-            TState* resultPtr = &result;
+            float* resultFloats = (float*)&result;
 
-            for (int i = 0; i < components; i++)
+            int i = 0;
+            if (Vector128.IsHardwareAccelerated && components >= Vector128<float>.Count)
             {
-                ((float*)resultPtr)[i] = ((float*)aPtr)[i] - ((float*)bPtr)[i];
+                int simdLimit = components - Vector128<float>.Count;
+                for (; i <= simdLimit; i += Vector128<float>.Count)
+                {
+                    Vector128<float> va = Vector128.Load(aFloats + i);
+                    Vector128<float> vb = Vector128.Load(bFloats + i);
+                    (va - vb).Store(resultFloats + i);
+                }
+            }
+
+            for (; i < components; i++)
+            {
+                resultFloats[i] = aFloats[i] - bFloats[i];
             }
 
             return result;
@@ -495,19 +542,16 @@ namespace Krut.Netcode
             where TState : unmanaged
         {
             int size = checked(sizeof(TState));
-            if (size < ComponentSize * 3)
+            if (size < ComponentSize * 3 || (size % ComponentSize) != 0)
             {
                 throw new ArgumentException(
-                    $"TState {typeof(TState).Name} has only {size / ComponentSize} components and cannot have a position.",
+                    $"TState {typeof(TState).Name} ({size} bytes) must hold at least 3 four-byte float components for a position.",
                     nameof(a));
             }
 
-            TState* aPtr = &a;
-            TState* bPtr = &b;
-            float dx = ((float*)aPtr)[0] - ((float*)bPtr)[0];
-            float dy = ((float*)aPtr)[1] - ((float*)bPtr)[1];
-            float dz = ((float*)aPtr)[2] - ((float*)bPtr)[2];
-            return MathF.Sqrt((dx * dx) + (dy * dy) + (dz * dz));
+            return Vector3.Distance(
+                Unsafe.As<TState, Vector3>(ref a),
+                Unsafe.As<TState, Vector3>(ref b));
         }
 
         /// <summary>Shortest-path interpolation of a rotation, with the result normalized.</summary>
