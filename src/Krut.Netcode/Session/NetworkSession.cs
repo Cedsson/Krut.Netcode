@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using LiteNetLib;
@@ -50,6 +51,9 @@ namespace Krut.Netcode
 
         private readonly bool _useSessionKeyExchange;
         private readonly NetworkEncryptionLayer? _encryptionLayer;
+        private readonly NetworkEncryptionLayer? _rendezvousEncryptionLayer;
+        private readonly NatRendezvousPacketLayer? _natRendezvousPacketLayer;
+        private IPEndPoint? _plaintextNatRendezvousEndPoint;
         private readonly ECDsa? _serverIdentitySigner;
         private readonly ECDsa? _serverIdentityVerifier;
 
@@ -131,6 +135,25 @@ namespace Krut.Netcode
                 {
                     _serverIdentityVerifier = ECDsa.Create();
                     _serverIdentityVerifier.ImportSubjectPublicKeyInfo(pubKey, out _);
+                }
+            }
+
+            if (Config.NatPunch?.RendezvousPreSharedKey is { } rendezvousKey)
+            {
+                _rendezvousEncryptionLayer = new NetworkEncryptionLayer(
+                    rendezvousKey,
+                    isServer: false,
+                    Config.NatPunch.PreviousRendezvousPreSharedKey,
+                    Config.NatPunch.RendezvousKeyId,
+                    Config.NatPunch.EnableAntiReplay,
+                    EncryptionStats);
+
+                if (_encryptionLayer is null)
+                {
+                    _natRendezvousPacketLayer = new NatRendezvousPacketLayer(_rendezvousEncryptionLayer);
+                    chain = chain is null
+                        ? new NetworkDatagramChain(_natRendezvousPacketLayer)
+                        : chain.WithPrependedLayer(_natRendezvousPacketLayer);
                 }
             }
 
@@ -284,6 +307,9 @@ namespace Krut.Netcode
 
         /// <summary>Encryption, authentication, anti-replay, and key-exchange counters for this session.</summary>
         public NetworkEncryptionStats EncryptionStats { get; } = new();
+
+        /// <summary>NAT rendezvous and hole-punching counters for this session.</summary>
+        public NatPunchStats NatStats { get; } = new();
 
         /// <summary>True if datagram-level PSK encryption or per-peer ECDH session encryption is enabled.</summary>
         public bool IsEncrypted => (Config.Encryption?.IsEnabled == true) || (DatagramChain?.HasEncryptionLayer == true);
@@ -568,7 +594,7 @@ namespace Krut.Netcode
         /// <summary>Copies an unconnected datagram into a pooled buffer and queues it for <see cref="DrainEvents"/>.</summary>
         internal void EnqueueUnconnected(System.Net.IPEndPoint endPoint, NetDataReader reader)
         {
-            if (UnconnectedReceived is null)
+            if (UnconnectedReceived is null && !AcceptsInternalUnconnected)
                 return;
 
             int length = reader.AvailableBytes;
@@ -699,6 +725,9 @@ namespace Krut.Netcode
 
                 if (_useSessionKeyExchange && !_disposed && IsRunning && _peers.Count > 0)
                     CheckKeyExchangeTimeouts();
+
+                if (!_disposed && IsRunning)
+                    OnSessionUpdate(deltaSeconds);
 
                 if (!_disposed && IsRunning)
                 {
@@ -909,7 +938,11 @@ namespace Krut.Netcode
             foreach (var peer in _peers.Values)
                 peer.DisposeCrypto();
             _peers.Clear();
+            ConfigureNatRendezvousRoute(null);
             _encryptionLayer?.ResetReplayState();
+            _rendezvousEncryptionLayer?.ResetReplayState();
+            _natRendezvousPacketLayer?.ResetReplayState();
+            _manager.UnconnectedMessagesEnabled = Config.UnconnectedMessages;
             ReleaseBuffers(_pending);
             _pending.Clear();
             _pendingPayloadEventCount = 0;
@@ -940,6 +973,10 @@ namespace Krut.Netcode
 
             ShutdownSession();
             _encryptionLayer?.Dispose();
+            if (_natRendezvousPacketLayer is not null)
+                _natRendezvousPacketLayer.Dispose();
+            else
+                _rendezvousEncryptionLayer?.Dispose();
             _serverIdentitySigner?.Dispose();
             _serverIdentityVerifier?.Dispose();
             _disposed = true;
@@ -1004,6 +1041,44 @@ namespace Krut.Netcode
         /// </summary>
         protected NetPeer? ConnectTo(System.Net.IPEndPoint endPoint, ReadOnlySpan<byte> connectData) => _manager.Connect(endPoint, connectData);
 
+        /// <summary>True while this session expects internal <c>"KNAT"</c> rendezvous/punch datagrams.</summary>
+        protected virtual bool AcceptsInternalUnconnected => false;
+
+        /// <summary>Handles a validated internal <c>"KNAT"</c> datagram during <see cref="DrainEvents"/>.</summary>
+        protected virtual void HandleInternalNatPacket(IPEndPoint remoteEndPoint, ReadOnlySpan<byte> payload)
+        {
+        }
+
+        /// <summary>Called once per <see cref="Update"/> after draining incoming events and before advancing the fixed tick clock.</summary>
+        protected virtual void OnSessionUpdate(float deltaSeconds)
+        {
+        }
+
+        /// <summary>Enables unconnected UDP datagram reception on the underlying socket (used by NAT punchthrough).</summary>
+        protected void EnableUnconnectedMessages() => _manager.UnconnectedMessagesEnabled = true;
+
+        /// <summary>Sends an internal unconnected datagram from the session socket while LiteNetLib is active.</summary>
+        protected bool SendUnconnectedRaw(IPEndPoint to, ReadOnlySpan<byte> data)
+            => _manager.IsRunning && _manager.SendUnconnectedMessage(data, to);
+
+        /// <summary>Configures packet-layer routing and replay exceptions for the active rendezvous server endpoint.</summary>
+        protected void ConfigureNatRendezvousRoute(IPEndPoint? rendezvousEndPoint)
+        {
+            IPEndPoint? normalized = rendezvousEndPoint is null ? null : NatPunchProtocol.NormalizeEndPoint(rendezvousEndPoint);
+            _plaintextNatRendezvousEndPoint = (normalized is not null && _encryptionLayer is not null && _rendezvousEncryptionLayer is null)
+                ? normalized
+                : null;
+
+            if (_encryptionLayer is not null)
+                _encryptionLayer.SetRendezvousRoute(normalized, _rendezvousEncryptionLayer, allowPlaintextNat: _rendezvousEncryptionLayer is null);
+            else
+                _natRendezvousPacketLayer?.SetRendezvousEndPoint(normalized);
+        }
+
+        /// <summary>True when <paramref name="endPoint"/> matches an active unencrypted rendezvous server route under a match-PSK session.</summary>
+        protected bool IsPlaintextNatRendezvousEndPoint(IPEndPoint endPoint)
+            => _plaintextNatRendezvousEndPoint is { } ep && NatPunchProtocol.EndPointsEqual(endPoint, ep);
+
         /// <summary>Adds a peer to the list without any event being raised.</summary>
         protected NetworkPeerState AddPeerDirect(NetPeer peer) => AddPeer(peer);
 
@@ -1062,7 +1137,8 @@ namespace Krut.Netcode
             }
         }
 
-        private void ReportCallbackException(Exception exception, int peerId = -1)
+        /// <summary>Reports a caught exception thrown by an application event callback without terminating session updates.</summary>
+        protected void ReportCallbackException(Exception exception, int peerId = -1)
         {
             CallbackExceptionCount++;
             ReportSafely(new NetworkError(
@@ -1070,6 +1146,9 @@ namespace Krut.Netcode
                 $"Unhandled exception in session callback: {exception.Message}",
                 peerId));
         }
+
+        /// <summary>Reports an error safely without letting a faulty <see cref="Error"/> handler abort NAT or queue processing.</summary>
+        protected void ReportErrorSafely(NetworkError error) => ReportSafely(error);
 
         /// <summary>Sets the server's own values on a new peer (name from the handshake) - used by <see cref="NetworkServer"/>.</summary>
         internal void DescribePeer(NetworkPeerState peer, string name, int joinTick)
@@ -1436,6 +1515,13 @@ namespace Krut.Netcode
         {
             try
             {
+                ReadOnlySpan<byte> payload = networkEvent.Data.AsSpan(0, networkEvent.Length);
+                if (AcceptsInternalUnconnected && NatPunchProtocol.HasMagicHeader(payload))
+                {
+                    HandleInternalNatPacket(networkEvent.EndPoint!, payload);
+                    return;
+                }
+
                 var handler = UnconnectedReceived;
                 if (handler is null)
                     return;

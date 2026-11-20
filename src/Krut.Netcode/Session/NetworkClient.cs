@@ -1,5 +1,7 @@
 using System;
+using System.Diagnostics;
 using System.Net;
+using System.Security.Cryptography;
 using LiteNetLib;
 using LiteNetLib.Utils;
 
@@ -59,6 +61,19 @@ namespace Krut.Netcode
         /// <summary>Cached server peer id so hot-path sends do not enumerate the peer dictionary.</summary>
         private int _serverPeerId = -1;
 
+        private NatPunchConfig? _natConfig;
+        private IPEndPoint? _natRendezvousEndPoint;
+        private IPEndPoint? _natInternalEndPoint;
+        private string? _natRoomCode;
+        private byte[]? _natRequestNonce;
+        private byte[]? _natPunchNonce;
+        private IPEndPoint? _natHostInternal;
+        private IPEndPoint? _natHostExternal;
+        private long _natDeadlineTimestamp;
+        private long _natNextSendTimestamp;
+        private bool _natIntroduced;
+        private bool _isNatReconnectSession;
+
         /// <param name="config">Settings to run with, or null for the defaults (see <see cref="NetworkConfig"/>). Copied, so changing your own instance afterwards has no effect on the running client.</param>
         public NetworkClient(NetworkConfig? config = null)
             : base(config ?? new NetworkConfig(), isServer: false)
@@ -98,6 +113,18 @@ namespace Krut.Netcode
         /// <summary>The server closed the connection, or it was lost.</summary>
         public event Action<DisconnectReason, string>? Closed;
 
+        /// <summary>Active or configured NAT room code when connecting via a rendezvous server, or null.</summary>
+        public string? NatRoomCode => _natRoomCode;
+
+        /// <summary>Endpoint and address classification resolved during the most recent NAT punchthrough, or null.</summary>
+        public NatPunchResult? LastNatPunchResult { get; private set; }
+
+        /// <summary>Raised when NAT hole punching succeeds and the direct LiteNetLib handshake starts.</summary>
+        public event Action<NatPunchResult>? NatPunchSucceeded;
+
+        /// <summary>Raised when NAT rendezvous lookup or hole punching fails or times out.</summary>
+        public event Action<string>? NatPunchFailed;
+
         /// <summary>
         /// Number of reconnect attempts made since the connection was lost (only if
         /// <see cref="NetworkConfig.AutoReconnect"/> is on). It is reset to 0 on every successful
@@ -117,6 +144,8 @@ namespace Krut.Netcode
         {
             if (IsRunning)
                 return false;
+
+            ClearNatState(keepReconnectTarget: false);
 
             if (playerName != null)
                 SetPlayerName(playerName);
@@ -145,13 +174,7 @@ namespace Krut.Netcode
                 return false;
             }
 
-            // The handshake is sent as raw bytes in the first packet, so that the server can read app
-            // id/version/name before it decides (see NetworkServer.HandleConnectionRequest).
-            var payload = new NetDataWriter(true, 96);
-            payload.Put(Config.ApplicationId);
-            payload.Put(Config.ProtocolVersion);
-            NetworkCodec.WriteName(payload, PlayerName);
-
+            NetDataWriter payload = BuildHandshakePayload();
             if (ConnectTo(endPoint, payload.Data.AsSpan(0, payload.Length)) is null)
             {
                 StopListener();
@@ -170,9 +193,129 @@ namespace Krut.Netcode
             return true;
         }
 
+        /// <summary>Connects to a host registered under <paramref name="roomCode"/> on the specified NAT rendezvous server.</summary>
+        public bool ConnectViaNat(string rendezvousHost, int rendezvousPort, string roomCode, string? playerName = null, int localPort = 0)
+        {
+            if (rendezvousPort is <= 0 or > 65535)
+            {
+                string reason = $"Invalid rendezvous port: {rendezvousPort}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            IPEndPoint endPoint;
+            try
+            {
+                string host = string.IsNullOrWhiteSpace(rendezvousHost) ? "127.0.0.1" : rendezvousHost.Trim();
+                endPoint = NetUtils.MakeEndPoint(host, rendezvousPort);
+            }
+            catch (Exception)
+            {
+                string reason = $"Invalid rendezvous address: {rendezvousHost}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            return ConnectViaNat(endPoint, roomCode, playerName, localPort);
+        }
+
+        /// <summary>Connects to a host registered under <paramref name="roomCode"/> on the specified NAT rendezvous endpoint.</summary>
+        public bool ConnectViaNat(IPEndPoint rendezvousEndPoint, string roomCode, string? playerName = null, int localPort = 0)
+        {
+            ArgumentNullException.ThrowIfNull(rendezvousEndPoint);
+
+            if (IsRunning)
+                return false;
+
+            if (rendezvousEndPoint.Port is <= 0 or > 65535)
+            {
+                string reason = $"Invalid rendezvous port: {rendezvousEndPoint.Port}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            if (!NatPunchProtocol.TryValidateRoomCode(roomCode, out string validRoom))
+            {
+                const string reason = "Room code must be non-empty, <= 64 UTF-8 bytes, and contain no control characters.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            if (!NatPunchProtocol.TryValidateAppId(Config.ApplicationId, out _))
+            {
+                const string reason = "ApplicationId exceeds the maximum length (64 UTF-8 bytes) for NAT join.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            if (playerName != null)
+                SetPlayerName(playerName);
+
+            _localPort = localPort is > 0 and <= 65535 ? localPort : 0;
+
+            if (!StartListener(null, _localPort))
+            {
+                Report(new NetworkError(NetworkErrorCode.StartFailed, "Could not open a local socket for networking."));
+                _state = NetworkClientState.Offline;
+                return false;
+            }
+
+            var natConfig = (Config.NatPunch ?? new NatPunchConfig()).Clone();
+            natConfig.Validate();
+            _natConfig = natConfig;
+
+            IPEndPoint normalizedRdv = NatPunchProtocol.NormalizeEndPoint(rendezvousEndPoint);
+            EnableUnconnectedMessages();
+            ConfigureNatRendezvousRoute(normalizedRdv);
+
+            IPEndPoint internalEp = natConfig.LocalEndPointOverride is not null
+                ? (natConfig.LocalEndPointOverride.Port > 0
+                    ? NatPunchProtocol.NormalizeEndPoint(natConfig.LocalEndPointOverride)
+                    : new IPEndPoint(NatPunchProtocol.NormalizeAddress(natConfig.LocalEndPointOverride.Address), BoundPort))
+                : NatPunchProtocol.DiscoverLocalEndPoint(BoundPort, normalizedRdv);
+
+            byte[] reqNonce = new byte[NatPunchProtocol.SecretBytes];
+            RandomNumberGenerator.Fill(reqNonce);
+
+            _natRendezvousEndPoint = normalizedRdv;
+            _natInternalEndPoint = internalEp;
+            _natRoomCode = validRoom;
+            _natRequestNonce = reqNonce;
+            _natPunchNonce = null;
+            _natHostInternal = null;
+            _natHostExternal = null;
+            _natIntroduced = false;
+            _isNatReconnectSession = true;
+            LastNatPunchResult = null;
+
+            long now = Stopwatch.GetTimestamp();
+            _natDeadlineTimestamp = now + MsToTimestampTicks(natConfig.PunchTimeoutMs);
+            _natNextSendTimestamp = now + MsToTimestampTicks(natConfig.PunchIntervalMs);
+
+            SetRunning(true);
+            _state = NetworkClientState.Punching;
+            _attempts = 0;
+            _reconnectTimer = 0f;
+
+            SendClientJoinRequest();
+            return true;
+        }
+
         /// <summary>Disconnects from the server (voluntarily, e.g. when the player leaves a match).</summary>
         public void Disconnect(string? reason = null)
         {
+            ClearNatState(keepReconnectTarget: false);
+
             if (!IsRunning)
             {
                 _state = NetworkClientState.Offline;
@@ -207,6 +350,7 @@ namespace Krut.Netcode
         /// <summary>Stops the client completely, including an ongoing reconnect.</summary>
         public void Stop()
         {
+            ClearNatState(keepReconnectTarget: false);
             _state = NetworkClientState.Offline;
             _attempts = 0;
             ShutdownSession();
@@ -235,7 +379,9 @@ namespace Krut.Netcode
             // Ensure socket is closed before dialing a fresh attempt.
             StopListener();
             SetRunning(false);
-            bool started = Connect(_address, _port, localPort: _localPort);
+            bool started = _isNatReconnectSession && _natRendezvousEndPoint is not null && !string.IsNullOrEmpty(_natRoomCode)
+                ? ConnectViaNat(_natRendezvousEndPoint, _natRoomCode, localPort: _localPort)
+                : Connect(_address, _port, localPort: _localPort);
             // Connect resets the counter for a fresh dial; a retry keeps counting the same outage.
             _attempts = attempts;
             if (!started)
@@ -340,12 +486,272 @@ namespace Krut.Netcode
         }
 
         /// <inheritdoc/>
+        protected override bool AcceptsInternalUnconnected => _state == NetworkClientState.Punching && _natRendezvousEndPoint is not null;
+
+        /// <inheritdoc/>
+        protected override void OnSessionUpdate(float deltaSeconds)
+        {
+            _ = deltaSeconds;
+            if (_state != NetworkClientState.Punching || _natRendezvousEndPoint is null || _natConfig is null)
+                return;
+
+            long now = Stopwatch.GetTimestamp();
+            if (now >= _natDeadlineTimestamp)
+            {
+                FailNatPunch("NAT punchthrough timed out.", allowAutoReconnect: true);
+                return;
+            }
+
+            if (now >= _natNextSendTimestamp)
+            {
+                if (!_natIntroduced)
+                {
+                    SendClientJoinRequest();
+                }
+                else if (_natPunchNonce is not null && _natHostExternal is not null)
+                {
+                    SendClientPunchPacket(_natHostExternal, _natPunchNonce, NatPunchFlags.None, isAck: false);
+                    if (_natHostInternal is not null && !NatPunchProtocol.EndPointsEqual(_natHostInternal, _natHostExternal))
+                        SendClientPunchPacket(_natHostInternal, _natPunchNonce, NatPunchFlags.None, isAck: false);
+                }
+
+                _natNextSendTimestamp = now + MsToTimestampTicks(_natConfig.PunchIntervalMs);
+            }
+        }
+
+        /// <inheritdoc/>
+        protected override void HandleInternalNatPacket(IPEndPoint remoteEndPoint, ReadOnlySpan<byte> payload)
+        {
+            if (_state != NetworkClientState.Punching
+                || _natRendezvousEndPoint is null
+                || _natConfig is null
+                || _natRoomCode is null
+                || _natRequestNonce is null)
+            {
+                return;
+            }
+
+            var type = (NatPacketType)payload[5];
+            switch (type)
+            {
+                case NatPacketType.JoinError:
+                {
+                    if (!NatPunchProtocol.EndPointsEqual(remoteEndPoint, _natRendezvousEndPoint)
+                        || !NatPunchProtocol.TryReadJoinError(payload, out ReadOnlySpan<byte> requestNonce, out NatRendezvousStatus status)
+                        || !CryptographicOperations.FixedTimeEquals(requestNonce, _natRequestNonce))
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    bool allowRetry = status != NatRendezvousStatus.RoomNotFound
+                        && status != NatRendezvousStatus.InvalidRequest;
+                    FailNatPunch($"Rendezvous server rejected join for room '{_natRoomCode}' ({status}).", allowRetry);
+                    break;
+                }
+                case NatPacketType.Introduce:
+                {
+                    if (!NatPunchProtocol.EndPointsEqual(remoteEndPoint, _natRendezvousEndPoint)
+                        || !NatPunchProtocol.TryReadIntroduce(
+                            payload,
+                            out byte role,
+                            out ReadOnlySpan<byte> punchNonce,
+                            out ReadOnlySpan<byte> requestNonce,
+                            out IPEndPoint hostInternal,
+                            out IPEndPoint hostExternal,
+                            out string roomCode)
+                        || role != 1
+                        || !string.Equals(roomCode, _natRoomCode, StringComparison.Ordinal)
+                        || !CryptographicOperations.FixedTimeEquals(requestNonce, _natRequestNonce))
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    if (_natIntroduced)
+                        return;
+
+                    byte[] punchNonceCopy = new byte[NatPunchProtocol.SecretBytes];
+                    punchNonce.CopyTo(punchNonceCopy);
+                    _natPunchNonce = punchNonceCopy;
+                    _natHostInternal = hostInternal;
+                    _natHostExternal = hostExternal;
+                    _natIntroduced = true;
+
+                    NatStats.IncrementIntroductionsReceived();
+
+                    SendClientPunchPacket(hostExternal, punchNonceCopy, NatPunchFlags.None, isAck: false);
+                    if (!NatPunchProtocol.EndPointsEqual(hostInternal, hostExternal))
+                        SendClientPunchPacket(hostInternal, punchNonceCopy, NatPunchFlags.None, isAck: false);
+
+                    _natNextSendTimestamp = Stopwatch.GetTimestamp() + MsToTimestampTicks(_natConfig.PunchIntervalMs);
+                    break;
+                }
+                case NatPacketType.Punch:
+                {
+                    if (!_natIntroduced
+                        || _natPunchNonce is null
+                        || !NatPunchProtocol.TryReadPunch(payload, out ReadOnlySpan<byte> punchNonce, out NatPunchFlags flags)
+                        || (flags & NatPunchFlags.FromHost) == 0
+                        || !CryptographicOperations.FixedTimeEquals(punchNonce, _natPunchNonce))
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    IPEndPoint sender = NatPunchProtocol.NormalizeEndPoint(remoteEndPoint);
+                    NatAddressKind kind = _natHostInternal is not null && NatPunchProtocol.EndPointsEqual(sender, _natHostInternal)
+                        ? NatAddressKind.Internal
+                        : NatAddressKind.External;
+
+                    NatPunchFlags ackFlags = NatPunchFlags.IsAck | (kind == NatAddressKind.Internal ? NatPunchFlags.IsInternal : NatPunchFlags.None);
+                    SendClientPunchPacket(sender, _natPunchNonce, ackFlags, isAck: true);
+                    SendClientPunchPacket(sender, _natPunchNonce, ackFlags, isAck: true);
+
+                    NetDataWriter handshake = BuildHandshakePayload();
+                    if (ConnectTo(sender, handshake.Data.AsSpan(0, handshake.Length)) is null)
+                    {
+                        FailNatPunch($"Could not send connection request to punched host {sender}.", allowAutoReconnect: true);
+                        return;
+                    }
+
+                    string completedRoom = _natRoomCode;
+                    _address = sender.Address.ToString();
+                    _port = sender.Port;
+                    _state = NetworkClientState.Connecting;
+                    ConfigureNatRendezvousRoute(null);
+
+                    var result = new NatPunchResult(sender, kind, completedRoom);
+                    LastNatPunchResult = result;
+                    NatStats.IncrementPunchesSucceeded();
+
+                    try
+                    {
+                        NatPunchSucceeded?.Invoke(result);
+                    }
+                    catch (Exception exception)
+                    {
+                        ReportCallbackException(exception);
+                    }
+
+                    break;
+                }
+                default:
+                    NatStats.IncrementRejectedPackets();
+                    break;
+            }
+        }
+
+        /// <inheritdoc/>
         protected override void OnStopping()
         {
             base.OnStopping();
+            ClearNatState(keepReconnectTarget: false);
             _serverPeerId = -1;
             _state = NetworkClientState.Offline;
         }
+
+        private NetDataWriter BuildHandshakePayload()
+        {
+            // The handshake is sent as raw bytes in the first packet, so that the server can read app
+            // id/version/name before it decides (see NetworkServer.HandleConnectionRequest).
+            var payload = new NetDataWriter(true, 96);
+            payload.Put(Config.ApplicationId);
+            payload.Put(Config.ProtocolVersion);
+            NetworkCodec.WriteName(payload, PlayerName);
+            return payload;
+        }
+
+        private void SendClientJoinRequest()
+        {
+            if (_natRendezvousEndPoint is null
+                || _natRoomCode is null
+                || _natRequestNonce is null
+                || _natInternalEndPoint is null)
+                return;
+
+            Span<byte> buffer = stackalloc byte[NatPunchProtocol.MaxPacketBytes];
+            int length = NatPunchProtocol.WriteClientJoinRequest(
+                buffer,
+                _natRoomCode,
+                Config.ApplicationId,
+                _natRequestNonce,
+                _natInternalEndPoint);
+            if (SendUnconnectedRaw(_natRendezvousEndPoint, buffer.Slice(0, length)))
+                NatStats.IncrementJoinRequestsSent();
+        }
+
+        private void SendClientPunchPacket(IPEndPoint destination, ReadOnlySpan<byte> punchNonce, NatPunchFlags flags, bool isAck)
+        {
+            Span<byte> buffer = stackalloc byte[NatPunchProtocol.MaxPacketBytes];
+            int length = NatPunchProtocol.WritePunch(buffer, punchNonce, flags);
+            if (SendUnconnectedRaw(destination, buffer.Slice(0, length)))
+            {
+                if (isAck)
+                    NatStats.IncrementPunchAcksSent();
+                else
+                    NatStats.IncrementPunchProbesSent();
+            }
+        }
+
+        private void FailNatPunch(string reason, bool allowAutoReconnect)
+        {
+            NatStats.IncrementPunchesFailed();
+            ConfigureNatRendezvousRoute(null);
+            ClearNatState(keepReconnectTarget: allowAutoReconnect);
+            StopListener();
+            SetRunning(false);
+
+            bool givenUp = _attempts >= Config.MaxConnectAttempts;
+            if (allowAutoReconnect && Config.AutoReconnect && !givenUp)
+            {
+                _state = NetworkClientState.Reconnecting;
+                _reconnectTimer = 0f;
+            }
+            else
+            {
+                _state = NetworkClientState.Offline;
+            }
+
+            ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+            InvokeNatFailedSafely(reason);
+        }
+
+        private void ClearNatState(bool keepReconnectTarget)
+        {
+            _natConfig = null;
+            _natInternalEndPoint = null;
+            _natRequestNonce = null;
+            _natPunchNonce = null;
+            _natHostInternal = null;
+            _natHostExternal = null;
+            _natDeadlineTimestamp = 0;
+            _natNextSendTimestamp = 0;
+            _natIntroduced = false;
+
+            if (!keepReconnectTarget)
+            {
+                _isNatReconnectSession = false;
+                _natRendezvousEndPoint = null;
+                _natRoomCode = null;
+                LastNatPunchResult = null;
+            }
+        }
+
+        private void InvokeNatFailedSafely(string reason)
+        {
+            try
+            {
+                NatPunchFailed?.Invoke(reason);
+            }
+            catch (Exception exception)
+            {
+                ReportCallbackException(exception);
+            }
+        }
+
+        private static long MsToTimestampTicks(int milliseconds)
+            => Math.Max(1L, Stopwatch.Frequency * milliseconds / 1000L);
 
         /// <summary>
         /// Listens for the server's messages: the welcome message sets the peer id, the tick rate, the tick and the name.
@@ -444,5 +850,8 @@ namespace Krut.Netcode
 
         /// <summary>The connection was lost and a new one is being attempted (see <see cref="NetworkConfig.AutoReconnect"/>).</summary>
         Reconnecting,
+
+        /// <summary>Communicating with the rendezvous server and probing UDP endpoints to punch through NAT.</summary>
+        Punching,
     }
 }

@@ -1,5 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Net;
+using System.Security.Cryptography;
 using LiteNetLib;
 using LiteNetLib.Utils;
 
@@ -35,6 +38,17 @@ namespace Krut.Netcode
     {
         private bool _started;
 
+        private NatPunchConfig? _natConfig;
+        private IPEndPoint? _natRendezvousEndPoint;
+        private IPEndPoint? _natInternalEndPoint;
+        private IPEndPoint? _natExternalEndPoint;
+        private string? _natRoomCode;
+        private byte[]? _natHostSecret;
+        private bool _natRegistered;
+        private long _natNextRegisterTimestamp;
+        private long _natHeartbeatIntervalTicks;
+        private readonly List<PendingHostPunch> _pendingPunches = new();
+
         /// <param name="config">Settings to run with, or null for the defaults (see <see cref="NetworkConfig"/>). Copied, so changing your own instance afterwards has no effect on the running server.</param>
         public NetworkServer(NetworkConfig? config = null)
             : base(config ?? new NetworkConfig(), isServer: true)
@@ -49,6 +63,200 @@ namespace Krut.Netcode
 
         /// <summary>Who gets to come in.</summary>
         public Func<NetworkConnectionRequest, NetworkConnectionResult>? ConnectionApproval { get; set; }
+
+        /// <summary>True when this host currently has a confirmed room registration on a rendezvous server.</summary>
+        public bool IsNatRegistered => _natRegistered;
+
+        /// <summary>Room code currently registered (or pending registration) for NAT punchthrough, or null.</summary>
+        public string? NatRoomCode => _natRoomCode;
+
+        /// <summary>Host public endpoint observed by the rendezvous server once registered, or null.</summary>
+        public IPEndPoint? NatExternalEndPoint => _natExternalEndPoint;
+
+        /// <summary>Raised when the rendezvous server confirms or renews room registration.</summary>
+        public event Action<NatRegistrationResult>? NatRoomRegistered;
+
+        /// <summary>Raised once per client punch when UDP hole punching succeeds.</summary>
+        public event Action<NatPunchResult>? NatPunchSucceeded;
+
+        /// <summary>Raised when NAT room registration or punching fails.</summary>
+        public event Action<string>? NatPunchFailed;
+
+        /// <summary>Starts the server and registers <paramref name="roomCode"/> on the specified rendezvous server.</summary>
+        public bool StartWithNat(string rendezvousHost, int rendezvousPort, string roomCode)
+        {
+            if (rendezvousPort is <= 0 or > 65535)
+            {
+                string reason = $"Invalid rendezvous port: {rendezvousPort}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            IPEndPoint endPoint;
+            try
+            {
+                string host = string.IsNullOrWhiteSpace(rendezvousHost) ? "127.0.0.1" : rendezvousHost.Trim();
+                endPoint = NetUtils.MakeEndPoint(host, rendezvousPort);
+            }
+            catch (Exception)
+            {
+                string reason = $"Invalid rendezvous address: {rendezvousHost}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            return StartWithNat(endPoint, roomCode);
+        }
+
+        /// <summary>Starts the server and registers <paramref name="roomCode"/> on the specified rendezvous endpoint.</summary>
+        public bool StartWithNat(IPEndPoint rendezvousEndPoint, string roomCode)
+        {
+            ArgumentNullException.ThrowIfNull(rendezvousEndPoint);
+
+            if (!Start())
+                return false;
+
+            if (!RegisterNatRoom(rendezvousEndPoint, roomCode))
+            {
+                Stop();
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>Registers (or switches) a room code on a rendezvous server while the server is already running.</summary>
+        public bool RegisterNatRoom(string rendezvousHost, int rendezvousPort, string roomCode)
+        {
+            if (rendezvousPort is <= 0 or > 65535)
+            {
+                string reason = $"Invalid rendezvous port: {rendezvousPort}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            IPEndPoint endPoint;
+            try
+            {
+                string host = string.IsNullOrWhiteSpace(rendezvousHost) ? "127.0.0.1" : rendezvousHost.Trim();
+                endPoint = NetUtils.MakeEndPoint(host, rendezvousPort);
+            }
+            catch (Exception)
+            {
+                string reason = $"Invalid rendezvous address: {rendezvousHost}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            return RegisterNatRoom(endPoint, roomCode);
+        }
+
+        /// <summary>Registers (or switches) a room code on a rendezvous endpoint while the server is already running.</summary>
+        public bool RegisterNatRoom(IPEndPoint rendezvousEndPoint, string roomCode)
+        {
+            ArgumentNullException.ThrowIfNull(rendezvousEndPoint);
+
+            if (!IsRunning)
+            {
+                const string reason = "Server must be started before registering a NAT room.";
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NotConnected, reason));
+                return false;
+            }
+
+            if (rendezvousEndPoint.Port is <= 0 or > 65535)
+            {
+                string reason = $"Invalid rendezvous port: {rendezvousEndPoint.Port}.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            if (!NatPunchProtocol.TryValidateRoomCode(roomCode, out string validRoom))
+            {
+                const string reason = "Room code must be non-empty, <= 64 UTF-8 bytes, and contain no control characters.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            if (!NatPunchProtocol.TryValidateAppId(Config.ApplicationId, out _))
+            {
+                const string reason = "ApplicationId exceeds the maximum length (64 UTF-8 bytes) for NAT registration.";
+                NatStats.IncrementPunchesFailed();
+                ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                InvokeNatFailedSafely(reason);
+                return false;
+            }
+
+            if (_natRendezvousEndPoint is not null)
+                UnregisterNatRoom();
+
+            var natConfig = (Config.NatPunch ?? new NatPunchConfig()).Clone();
+            natConfig.Validate();
+            _natConfig = natConfig;
+
+            IPEndPoint normalizedRdv = NatPunchProtocol.NormalizeEndPoint(rendezvousEndPoint);
+            EnableUnconnectedMessages();
+            ConfigureNatRendezvousRoute(normalizedRdv);
+
+            IPEndPoint internalEp = natConfig.LocalEndPointOverride is not null
+                ? (natConfig.LocalEndPointOverride.Port > 0
+                    ? NatPunchProtocol.NormalizeEndPoint(natConfig.LocalEndPointOverride)
+                    : new IPEndPoint(NatPunchProtocol.NormalizeAddress(natConfig.LocalEndPointOverride.Address), BoundPort))
+                : NatPunchProtocol.DiscoverLocalEndPoint(BoundPort, normalizedRdv);
+
+            byte[] secret = new byte[NatPunchProtocol.SecretBytes];
+            RandomNumberGenerator.Fill(secret);
+
+            _natRendezvousEndPoint = normalizedRdv;
+            _natInternalEndPoint = internalEp;
+            _natExternalEndPoint = null;
+            _natRoomCode = validRoom;
+            _natHostSecret = secret;
+            _natRegistered = false;
+            _natHeartbeatIntervalTicks = MsToTimestampTicks(natConfig.HeartbeatIntervalMs);
+            _pendingPunches.Clear();
+
+            SendHostRegisterPacket(isHeartbeat: false);
+            _natNextRegisterTimestamp = Stopwatch.GetTimestamp() + MsToTimestampTicks(natConfig.RegisterRetryIntervalMs);
+            return true;
+        }
+
+        /// <summary>Unregisters the active NAT room (best effort) and clears all pending hole-punching states.</summary>
+        public void UnregisterNatRoom()
+        {
+            if (_natRendezvousEndPoint is { } rdv
+                && _natRoomCode is { } room
+                && _natHostSecret is { } secret
+                && IsRunning)
+            {
+                Span<byte> buffer = stackalloc byte[NatPunchProtocol.MaxPacketBytes];
+                int len = NatPunchProtocol.WriteHostUnregister(buffer, room, Config.ApplicationId, secret);
+                SendUnconnectedRaw(rdv, buffer.Slice(0, len));
+            }
+
+            _natConfig = null;
+            _natRendezvousEndPoint = null;
+            _natInternalEndPoint = null;
+            _natExternalEndPoint = null;
+            _natRoomCode = null;
+            _natHostSecret = null;
+            _natRegistered = false;
+            _natNextRegisterTimestamp = 0;
+            _natHeartbeatIntervalTicks = 0;
+            _pendingPunches.Clear();
+            ConfigureNatRendezvousRoute(null);
+        }
 
         /// <summary>Listens on <see cref="NetworkConfig.Port"/>. Returns false if the port could not be bound (e.g. it is taken).</summary>
         public bool Start()
@@ -228,6 +436,12 @@ namespace Krut.Netcode
         /// </summary>
         internal override void HandleConnectionRequest(ConnectionRequest request)
         {
+            if (IsPlaintextNatRendezvousEndPoint(request.RemoteEndPoint))
+            {
+                request.Reject();
+                return;
+            }
+
             // The handshake: the client sends app id, protocol version and name in a dedicated area of the
             // first packet.
             var data = request.Data;
@@ -331,11 +545,313 @@ namespace Krut.Netcode
         }
 
         /// <inheritdoc/>
+        protected override bool AcceptsInternalUnconnected => _natRendezvousEndPoint is not null;
+
+        /// <inheritdoc/>
+        protected override void OnSessionUpdate(float deltaSeconds)
+        {
+            _ = deltaSeconds;
+            if (_natRendezvousEndPoint is null || _natConfig is null)
+                return;
+
+            long now = Stopwatch.GetTimestamp();
+            if (now >= _natNextRegisterTimestamp)
+            {
+                SendHostRegisterPacket(isHeartbeat: _natRegistered);
+                _natNextRegisterTimestamp = now + (_natRegistered
+                    ? _natHeartbeatIntervalTicks
+                    : MsToTimestampTicks(_natConfig.RegisterRetryIntervalMs));
+            }
+
+            for (int i = _pendingPunches.Count - 1; i >= 0; i--)
+            {
+                var entry = _pendingPunches[i];
+                if (now >= entry.ExpiresAtTimestamp)
+                {
+                    bool failed = !entry.Succeeded;
+                    _pendingPunches.RemoveAt(i);
+                    if (failed)
+                        NatStats.IncrementPunchesFailed();
+                    continue;
+                }
+
+                if (!entry.Succeeded && now >= entry.NextProbeTimestamp)
+                {
+                    SendPunchPacket(entry.PeerExternal, entry.PunchNonce, NatPunchFlags.FromHost, isAck: false);
+                    if (!NatPunchProtocol.EndPointsEqual(entry.PeerInternal, entry.PeerExternal))
+                        SendPunchPacket(entry.PeerInternal, entry.PunchNonce, NatPunchFlags.FromHost, isAck: false);
+
+                    entry.NextProbeTimestamp = now + MsToTimestampTicks(_natConfig.PunchIntervalMs);
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        protected override void HandleInternalNatPacket(IPEndPoint remoteEndPoint, ReadOnlySpan<byte> payload)
+        {
+            if (_natRendezvousEndPoint is null
+                || _natConfig is null
+                || _natHostSecret is null
+                || _natRoomCode is null)
+            {
+                return;
+            }
+
+            var type = (NatPacketType)payload[5];
+            switch (type)
+            {
+                case NatPacketType.HostRegistered:
+                {
+                    if (!NatPunchProtocol.EndPointsEqual(remoteEndPoint, _natRendezvousEndPoint)
+                        || !NatPunchProtocol.TryReadHostRegistered(
+                            payload,
+                            out string roomCode,
+                            out NatRendezvousStatus status,
+                            out IPEndPoint observedExternal,
+                            out ushort leaseSeconds)
+                        || !string.Equals(roomCode, _natRoomCode, StringComparison.Ordinal))
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    if (status == NatRendezvousStatus.Ok)
+                    {
+                        _natExternalEndPoint = observedExternal;
+                        _natRegistered = true;
+
+                        long maxLeaseHeartbeatMs = Math.Max(1000L, (long)leaseSeconds * 500L);
+                        int intervalMs = (int)Math.Min(_natConfig.HeartbeatIntervalMs, maxLeaseHeartbeatMs);
+                        _natHeartbeatIntervalTicks = MsToTimestampTicks(intervalMs);
+                        _natNextRegisterTimestamp = Stopwatch.GetTimestamp() + _natHeartbeatIntervalTicks;
+
+                        try
+                        {
+                            NatRoomRegistered?.Invoke(new NatRegistrationResult(roomCode, observedExternal, leaseSeconds));
+                        }
+                        catch (Exception exception)
+                        {
+                            ReportCallbackException(exception);
+                        }
+                    }
+                    else
+                    {
+                        string reason = $"Rendezvous server rejected room '{roomCode}' ({status}).";
+                        if (status is NatRendezvousStatus.RoomTaken or NatRendezvousStatus.InvalidRequest)
+                            UnregisterNatRoom();
+
+                        NatStats.IncrementPunchesFailed();
+                        ReportErrorSafely(new NetworkError(NetworkErrorCode.NatPunchFailed, reason));
+                        InvokeNatFailedSafely(reason);
+                    }
+                    break;
+                }
+                case NatPacketType.Introduce:
+                {
+                    if (!NatPunchProtocol.EndPointsEqual(remoteEndPoint, _natRendezvousEndPoint)
+                        || !NatPunchProtocol.TryReadIntroduce(
+                            payload,
+                            out byte role,
+                            out ReadOnlySpan<byte> punchNonce,
+                            out ReadOnlySpan<byte> authSecret,
+                            out IPEndPoint peerInternal,
+                            out IPEndPoint peerExternal,
+                            out string roomCode)
+                        || role != 0
+                        || !string.Equals(roomCode, _natRoomCode, StringComparison.Ordinal)
+                        || !CryptographicOperations.FixedTimeEquals(authSecret, _natHostSecret))
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    NatStats.IncrementIntroductionsReceived();
+
+                    long now = Stopwatch.GetTimestamp();
+                    for (int i = _pendingPunches.Count - 1; i >= 0; i--)
+                    {
+                        if (now >= _pendingPunches[i].ExpiresAtTimestamp)
+                        {
+                            if (!_pendingPunches[i].Succeeded)
+                                NatStats.IncrementPunchesFailed();
+                            _pendingPunches.RemoveAt(i);
+                        }
+                    }
+
+                    for (int i = 0; i < _pendingPunches.Count; i++)
+                    {
+                        if (CryptographicOperations.FixedTimeEquals(_pendingPunches[i].PunchNonce, punchNonce))
+                            return;
+                    }
+
+                    while (_pendingPunches.Count >= _natConfig.MaxPendingPunches)
+                    {
+                        if (!_pendingPunches[0].Succeeded)
+                            NatStats.IncrementPunchesFailed();
+                        _pendingPunches.RemoveAt(0);
+                    }
+
+                    byte[] nonceCopy = new byte[NatPunchProtocol.SecretBytes];
+                    punchNonce.CopyTo(nonceCopy);
+                    var entry = new PendingHostPunch(
+                        nonceCopy,
+                        peerInternal,
+                        peerExternal,
+                        now + MsToTimestampTicks(_natConfig.PunchTimeoutMs),
+                        now + MsToTimestampTicks(_natConfig.PunchIntervalMs));
+                    _pendingPunches.Add(entry);
+
+                    SendPunchPacket(peerExternal, nonceCopy, NatPunchFlags.FromHost, isAck: false);
+                    if (!NatPunchProtocol.EndPointsEqual(peerInternal, peerExternal))
+                        SendPunchPacket(peerInternal, nonceCopy, NatPunchFlags.FromHost, isAck: false);
+                    break;
+                }
+                case NatPacketType.Punch:
+                {
+                    if (!NatPunchProtocol.TryReadPunch(payload, out ReadOnlySpan<byte> punchNonce, out NatPunchFlags flags)
+                        || (flags & NatPunchFlags.FromHost) != 0)
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    PendingHostPunch? match = null;
+                    for (int i = _pendingPunches.Count - 1; i >= 0; i--)
+                    {
+                        if (CryptographicOperations.FixedTimeEquals(_pendingPunches[i].PunchNonce, punchNonce))
+                        {
+                            match = _pendingPunches[i];
+                            break;
+                        }
+                    }
+
+                    if (match is null)
+                    {
+                        NatStats.IncrementRejectedPackets();
+                        return;
+                    }
+
+                    IPEndPoint normalizedSender = NatPunchProtocol.NormalizeEndPoint(remoteEndPoint);
+                    bool isInternal = NatPunchProtocol.EndPointsEqual(normalizedSender, match.PeerInternal);
+                    NatPunchFlags replyFlags = NatPunchFlags.IsAck | NatPunchFlags.FromHost | (isInternal ? NatPunchFlags.IsInternal : NatPunchFlags.None);
+
+                    if (!match.Succeeded)
+                    {
+                        match.Succeeded = true;
+                        SendPunchPacket(normalizedSender, match.PunchNonce, replyFlags, isAck: true);
+                        SendPunchPacket(normalizedSender, match.PunchNonce, replyFlags, isAck: true);
+                        NatStats.IncrementPunchesSucceeded();
+
+                        try
+                        {
+                            NatPunchSucceeded?.Invoke(new NatPunchResult(
+                                normalizedSender,
+                                isInternal ? NatAddressKind.Internal : NatAddressKind.External,
+                                _natRoomCode));
+                        }
+                        catch (Exception exception)
+                        {
+                            ReportCallbackException(exception);
+                        }
+                    }
+                    else if ((flags & NatPunchFlags.IsAck) == 0)
+                    {
+                        SendPunchPacket(normalizedSender, match.PunchNonce, replyFlags, isAck: true);
+                    }
+
+                    break;
+                }
+                default:
+                    NatStats.IncrementRejectedPackets();
+                    break;
+            }
+        }
+
+        /// <inheritdoc/>
         protected override void OnStopping()
         {
+            UnregisterNatRoom();
             _started = false;
             BroadcastSystemChat("The server is shutting down.");
             DisconnectAll("The server is shutting down.");
+        }
+
+        private void SendHostRegisterPacket(bool isHeartbeat)
+        {
+            if (_natRendezvousEndPoint is null
+                || _natRoomCode is null
+                || _natHostSecret is null
+                || _natInternalEndPoint is null)
+                return;
+
+            Span<byte> buffer = stackalloc byte[NatPunchProtocol.MaxPacketBytes];
+            int length = NatPunchProtocol.WriteHostRegister(
+                buffer,
+                _natRoomCode,
+                Config.ApplicationId,
+                _natHostSecret,
+                _natInternalEndPoint,
+                Config.ProtocolVersion);
+
+            if (SendUnconnectedRaw(_natRendezvousEndPoint, buffer.Slice(0, length)))
+            {
+                if (isHeartbeat)
+                    NatStats.IncrementHeartbeatsSent();
+                else
+                    NatStats.IncrementRegistrationsSent();
+            }
+        }
+
+        private void SendPunchPacket(IPEndPoint destination, ReadOnlySpan<byte> punchNonce, NatPunchFlags flags, bool isAck)
+        {
+            Span<byte> buffer = stackalloc byte[NatPunchProtocol.MaxPacketBytes];
+            int length = NatPunchProtocol.WritePunch(buffer, punchNonce, flags);
+            if (SendUnconnectedRaw(destination, buffer.Slice(0, length)))
+            {
+                if (isAck)
+                    NatStats.IncrementPunchAcksSent();
+                else
+                    NatStats.IncrementPunchProbesSent();
+            }
+        }
+
+        private void InvokeNatFailedSafely(string reason)
+        {
+            try
+            {
+                NatPunchFailed?.Invoke(reason);
+            }
+            catch (Exception exception)
+            {
+                ReportCallbackException(exception);
+            }
+        }
+
+        private static long MsToTimestampTicks(int milliseconds)
+            => Math.Max(1L, Stopwatch.Frequency * milliseconds / 1000L);
+
+        private sealed class PendingHostPunch
+        {
+            public PendingHostPunch(
+                byte[] punchNonce,
+                IPEndPoint peerInternal,
+                IPEndPoint peerExternal,
+                long expiresAtTimestamp,
+                long nextProbeTimestamp)
+            {
+                PunchNonce = punchNonce;
+                PeerInternal = peerInternal;
+                PeerExternal = peerExternal;
+                ExpiresAtTimestamp = expiresAtTimestamp;
+                NextProbeTimestamp = nextProbeTimestamp;
+            }
+
+            public byte[] PunchNonce { get; }
+            public IPEndPoint PeerInternal { get; }
+            public IPEndPoint PeerExternal { get; }
+            public long ExpiresAtTimestamp { get; }
+            public long NextProbeTimestamp { get; set; }
+            public bool Succeeded { get; set; }
         }
 
         /// <summary>System message to all clients.</summary>

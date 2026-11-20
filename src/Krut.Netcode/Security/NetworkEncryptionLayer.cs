@@ -55,6 +55,21 @@ namespace Krut.Netcode
         private readonly AntiReplayWindow[] _replayWindows = new AntiReplayWindow[MaxReplayPeers];
         private int _replayCount;
         private int _replayRingHead;
+        private volatile RendezvousRoute? _rendezvousRoute;
+
+        private sealed class RendezvousRoute
+        {
+            public readonly IPEndPoint EndPoint;
+            public readonly NetworkEncryptionLayer? Layer;
+            public readonly bool AllowPlaintextNat;
+
+            public RendezvousRoute(IPEndPoint endPoint, NetworkEncryptionLayer? layer, bool allowPlaintextNat)
+            {
+                EndPoint = endPoint;
+                Layer = layer;
+                AllowPlaintextNat = allowPlaintextNat;
+            }
+        }
 
         public NetworkEncryptionLayer(
             ReadOnlySpan<byte> preSharedKey,
@@ -114,8 +129,28 @@ namespace Krut.Netcode
         /// <summary>Encryption, authentication, and replay counters for this layer.</summary>
         public NetworkEncryptionStats Stats => _stats;
 
+        internal void SetRendezvousRoute(IPEndPoint? endPoint, NetworkEncryptionLayer? rendezvousLayer, bool allowPlaintextNat)
+        {
+            _rendezvousRoute = endPoint is null
+                ? null
+                : new RendezvousRoute(NatPunchProtocol.NormalizeEndPoint(endPoint), rendezvousLayer, allowPlaintextNat);
+        }
+
         public override void ProcessOutBoundPacket(ref IPEndPoint endPoint, ref byte[] data, ref int offset, ref int length)
         {
+            var route = _rendezvousRoute;
+            if (route is not null && NatPunchProtocol.EndPointsEqual(endPoint, route.EndPoint))
+            {
+                if (route.Layer is not null)
+                {
+                    route.Layer.ProcessOutBoundPacket(ref endPoint, ref data, ref offset, ref length);
+                    return;
+                }
+
+                if (route.AllowPlaintextNat && NatPunchProtocol.IsRawLiteNetLibUnconnectedNatPacket(data, offset, length))
+                    return;
+            }
+
             lock (_outLock)
             {
                 if (_disposed || data is null || length <= 0 || offset < 0 || offset + length > data.Length)
@@ -160,6 +195,26 @@ namespace Krut.Netcode
 
         public override void ProcessInboundPacket(ref IPEndPoint endPoint, ref byte[] data, ref int length)
         {
+            var route = _rendezvousRoute;
+            if (route is not null && NatPunchProtocol.EndPointsEqual(endPoint, route.EndPoint))
+            {
+                if (route.Layer is not null)
+                {
+                    route.Layer.ProcessInboundPacket(ref endPoint, ref data, ref length);
+                    return;
+                }
+
+                if (route.AllowPlaintextNat)
+                {
+                    if (NatPunchProtocol.IsRawLiteNetLibUnconnectedNatPacket(data, 0, length))
+                        return;
+
+                    _stats.IncrementMalformed();
+                    length = 0;
+                    return;
+                }
+            }
+
             lock (_inLock)
             {
                 if (_disposed || data is null || length <= OverheadBytes || length > data.Length)
@@ -189,7 +244,10 @@ namespace Krut.Netcode
 
                 ulong senderSalt = ReadUInt48BigEndian(header.Slice(1, 6));
                 var replayKey = _enableAntiReplay
-                    ? new ReplayKey(endPoint?.Address ?? IPAddress.None, endPoint?.Port ?? 0, senderSalt)
+                    ? new ReplayKey(
+                        endPoint is not null ? NatPunchProtocol.NormalizeAddress(endPoint.Address) : IPAddress.None,
+                        endPoint?.Port ?? 0,
+                        senderSalt)
                     : default;
 
                 int existingSlot = -1;
@@ -305,6 +363,7 @@ namespace Krut.Netcode
                         return;
 
                     _disposed = true;
+                    _rendezvousRoute = null;
                     _outboundAes.Dispose();
                     _inboundAes.Dispose();
                     _previousInboundAes?.Dispose();

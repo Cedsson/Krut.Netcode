@@ -186,6 +186,12 @@ namespace Krut.Netcode
         /// </summary>
         public NetworkEncryptionConfig? Encryption { get; set; }
 
+        /// <summary>
+        /// Optional NAT punchthrough settings (rendezvous PSK encryption, probe/heartbeat cadence, timeouts, and LAN
+        /// endpoint override). Leave <c>null</c> for defaults when using NAT punchthrough.
+        /// </summary>
+        public NatPunchConfig? NatPunch { get; set; }
+
         /// <summary>Clamps the values to valid intervals.</summary>
         public void Validate()
         {
@@ -225,6 +231,7 @@ namespace Krut.Netcode
                 MaxUnconnectedEventsPerPoll = 1;
             if (MaxEventsPerDrain < 0)
                 MaxEventsPerDrain = 0;
+            NatPunch?.Validate();
         }
 
         /// <summary>Seconds per tick - the session's clock is stepped by this, not by the frame.</summary>
@@ -235,6 +242,7 @@ namespace Krut.Netcode
         {
             var copy = (NetworkConfig)MemberwiseClone();
             copy.Encryption = Encryption?.Clone();
+            copy.NatPunch = NatPunch?.Clone();
             return copy;
         }
     }

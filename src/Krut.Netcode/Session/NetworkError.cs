@@ -37,6 +37,9 @@ namespace Krut.Netcode
 
         /// <summary>An encryption handshake, authentication, or replay check failed.</summary>
         SecurityError,
+
+        /// <summary>NAT rendezvous registration or hole punching failed or timed out.</summary>
+        NatPunchFailed,
     }
 
     /// <summary>A network error to show/log - the library never throws exceptions at the game logic for network problems.</summary>
