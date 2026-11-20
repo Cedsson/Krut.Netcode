@@ -33,9 +33,6 @@ namespace Krut.Netcode
     /// </para>
     public class NetworkServer : NetworkSession
     {
-        /// <summary>PlayerInfo for peer ids that have already joined - sent to new clients so that their lobby is complete immediately.</summary>
-        private readonly Dictionary<int, PlayerInfoMessage> _playerInfo = new();
-
         private bool _started;
 
         /// <param name="config">Settings to run with, or null for the defaults (see <see cref="NetworkConfig"/>). Copied, so changing your own instance afterwards has no effect on the running server.</param>
@@ -80,10 +77,7 @@ namespace Krut.Netcode
                 return;
 
             _started = false;
-            Dispose();
-            foreach (var info in _playerInfo.Values)
-                NetworkMessages.Recycle(info);
-            _playerInfo.Clear();
+            ShutdownSession();
         }
 
         /// <summary>Sends a message to all clients.</summary>
@@ -141,15 +135,8 @@ namespace Krut.Netcode
         /// </para>
         protected override void OnPeerConnectedEvent(NetworkPeerState peer)
         {
-            var joined = Rent<PlayerInfoMessage>();
-            joined.PeerId = peer.Id;
-            joined.PlayerName = peer.Name;
-            joined.JoinTick = CurrentTick;
-
-            // Stored BEFORE the lobby is sent, so that the new client gets its own row too. Otherwise exactly
-            // that player is missing from their own lobby list, and a game that builds its list on PeerId to
-            // PlayerInfo gets a row that cannot be found - and that is a list that gets counted and sorted.
-            _playerInfo[peer.Id] = joined;
+            peer.JoinTick = CurrentTick;
+            peer.HasJoined = true;
 
             // The welcome message first: the client needs its peer id before anything else can be sent, and it
             // gets the server's tick so that both sides count in the same time base.
@@ -162,12 +149,25 @@ namespace Krut.Netcode
 
             // Then the whole lobby (including the peer's own row), so the new
             // client doesn't have to ask "who is here?".
-            foreach (var info in _playerInfo.Values)
-                Send(peer.Id, CloneInfo(info));
+            foreach (var connected in Peers)
+            {
+                if (!connected.HasJoined)
+                    continue;
+
+                var info = Rent<PlayerInfoMessage>();
+                info.PeerId = connected.Id;
+                info.PlayerName = connected.Name;
+                info.JoinTick = connected.JoinTick;
+                Send(peer.Id, info);
+            }
 
             // Those who were already in get the new player - the peer's own
             // row it already got above, so the duplication is avoided.
-            Broadcast(CloneInfo(joined), peer.Id);
+            var joined = Rent<PlayerInfoMessage>();
+            joined.PeerId = peer.Id;
+            joined.PlayerName = peer.Name;
+            joined.JoinTick = peer.JoinTick;
+            Broadcast(joined, peer.Id);
 
             BroadcastSystemChat($"{peer.Name} joined.");
         }
@@ -179,10 +179,10 @@ namespace Krut.Netcode
             // accepted (rejected app id, wrong version, full lobby) also gives a PeerDisconnected, but without
             // it ever having been in the lobby - writing "Player left" in the log for every stray process on
             // the port would be spam, and a player would see their own "joined" line disappear right away.
-            if (!_playerInfo.Remove(peer.Id, out var removed))
+            if (!peer.HasJoined)
                 return;
 
-            NetworkMessages.Recycle(removed);
+            peer.HasJoined = false;
             BroadcastSystemChat($"{peer.Name} left ({DescribeReason(info.Reason)}).");
         }
 
@@ -309,7 +309,8 @@ namespace Krut.Netcode
                     result = NetworkConnectionResult.Reject("The server could not accept you right now.");
                 }
             }
-            else if (ClientCount >= Config.MaxClients)
+
+            if (result.Accepted && ClientCount >= Config.MaxClients)
             {
                 result = NetworkConnectionResult.Reject($"The lobby is full ({ClientCount}/{Config.MaxClients}).");
             }
@@ -332,7 +333,9 @@ namespace Krut.Netcode
         /// <inheritdoc/>
         protected override void OnStopping()
         {
+            _started = false;
             BroadcastSystemChat("The server is shutting down.");
+            DisconnectAll("The server is shutting down.");
         }
 
         /// <summary>System message to all clients.</summary>
@@ -350,20 +353,6 @@ namespace Krut.Netcode
         private NetworkPeerState Attach(NetPeer peer) => AddPeerDirect(peer);
 
         /// <summary>
-        /// A fresh instance for each recipient: the lobby row is rented out and recycled by <see cref="Send"/>,
-        /// so sending the stored instance to two peers would hand the same object to two sends and the first
-        /// one to send would recycle it out from under the second.
-        /// </summary>
-        private static PlayerInfoMessage CloneInfo(PlayerInfoMessage source)
-        {
-            var clone = NetworkMessagePool<PlayerInfoMessage>.Rent();
-            clone.PeerId = source.PeerId;
-            clone.JoinTick = source.JoinTick;
-            clone.PlayerName = source.PlayerName;
-            return clone;
-        }
-
-        /// <summary>
         /// Wraps a reason string in the data section LiteNetLib delivers alongside a disconnect. 64 bytes is
         /// enough for any message a game would put here, and the writer is built per call because this happens
         /// once per disconnect, not per packet.
@@ -371,7 +360,7 @@ namespace Krut.Netcode
         private NetDataWriter Reason(string text)
         {
             var writer = new NetDataWriter(true, 64);
-            writer.Put(text);
+            NetworkCodec.WriteText(writer, NetworkCodec.SanitizeText(text));
             return writer;
         }
 

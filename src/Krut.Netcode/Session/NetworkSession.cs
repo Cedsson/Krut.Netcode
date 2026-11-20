@@ -263,36 +263,82 @@ namespace Krut.Netcode
         /// <summary>The list that <see cref="NetworkListener"/> writes to and <see cref="Update"/> drains.</summary>
         internal List<NetworkEvent> PendingEvents => _pending;
 
+        private const int PooledPacketBufferSize = 2048;
+        private const int PooledPacketBufferCapacity = 256;
+        private readonly byte[]?[] _packetBuffers = new byte[]?[PooledPacketBufferCapacity];
+        private int _packetBufferCount;
+
+        private byte[] RentPacketBuffer(int length)
+        {
+            if (length <= PooledPacketBufferSize)
+            {
+                if (_packetBufferCount > 0)
+                {
+                    byte[] buffer = _packetBuffers[--_packetBufferCount]!;
+                    _packetBuffers[_packetBufferCount] = null;
+                    return buffer;
+                }
+
+                return new byte[PooledPacketBufferSize];
+            }
+
+            return ArrayPool<byte>.Shared.Rent(length);
+        }
+
+        private void ReturnPacketBuffer(byte[] buffer)
+        {
+            if (buffer.Length == PooledPacketBufferSize)
+            {
+                if (_packetBufferCount < PooledPacketBufferCapacity)
+                    _packetBuffers[_packetBufferCount++] = buffer;
+                return;
+            }
+
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
         /// <summary>
         /// Called by <see cref="NetworkListener"/> for every received packet: copies the bytes into a pooled
         /// buffer (LiteNetLib reuses its own) and queues them for <see cref="DrainEvents"/>.
         /// </summary>
-        internal void EnqueueReceived(NetPeer peer, NetPacketReader reader, NetworkDelivery delivery)
+        internal void EnqueueReceived(NetPeer peer, NetDataReader reader, NetworkDelivery delivery)
         {
             int length = reader.AvailableBytes;
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            byte[] buffer = RentPacketBuffer(length);
             reader.GetRemainingBytesSpan().CopyTo(buffer);
             _pending.Add(NetworkEvent.Received(peer, buffer, length, delivery));
         }
 
+        /// <summary>Maximum allowed size in bytes for an unconnected datagram.</summary>
+        public const int MaxUnconnectedMessageBytes = 1500;
+
         /// <summary>Copies an unconnected datagram into a pooled buffer and queues it for <see cref="DrainEvents"/>.</summary>
-        internal void EnqueueUnconnected(System.Net.IPEndPoint endPoint, NetPacketReader reader)
+        internal void EnqueueUnconnected(System.Net.IPEndPoint endPoint, NetDataReader reader)
         {
+            if (UnconnectedReceived is null)
+                return;
+
             int length = reader.AvailableBytes;
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            if (length <= 0 || length > MaxUnconnectedMessageBytes)
+            {
+                MalformedMessageCount++;
+                return;
+            }
+
+            byte[] buffer = RentPacketBuffer(length);
             reader.GetRemainingBytesSpan().CopyTo(buffer);
             _pending.Add(NetworkEvent.Unconnected(endPoint, buffer, length));
         }
 
         /// <summary>Gives the pooled receive buffers of queued events back to the pool.</summary>
-        private static void ReleaseBuffers(List<NetworkEvent> events)
+        private void ReleaseBuffers(List<NetworkEvent> events)
         {
             foreach (var networkEvent in events)
             {
                 if ((networkEvent.Kind == NetworkEventKind.Received || networkEvent.Kind == NetworkEventKind.Unconnected)
                     && networkEvent.Data is { } data)
                 {
-                    ArrayPool<byte>.Shared.Return(data);
+                    ReturnPacketBuffer(data);
                 }
             }
         }
@@ -421,18 +467,44 @@ namespace Krut.Netcode
 
             int n = 0;
             foreach (var peer in _peers.Values)
-                targets[n++] = peer;
-
-            for (int i = 0; i < n; i++)
             {
-                if (targets[i].Id != exceptPeerId)
-                    SendInternal(targets[i], message, recycle: false);
-
-                targets[i] = null!;
+                if (peer.Id != exceptPeerId)
+                    targets[n++] = peer;
             }
 
-            _broadcastTargets = targets;
-            RecycleSent(message);
+            if (n == 0)
+            {
+                _broadcastTargets = targets;
+                RecycleSent(message);
+                return;
+            }
+
+            byte wireType = 0;
+            try
+            {
+                _writer.Reset();
+                wireType = GetWireTypeByte(message);
+                _writer.Put(wireType);
+                message.Write(_writer);
+
+                byte channel = message.Channel;
+                var delivery = message.Delivery;
+                var deliveryMethod = NetworkChannels.ToDeliveryMethod(delivery);
+                bool simActive = _simulation is { IsActive: true };
+
+                for (int i = 0; i < n; i++)
+                {
+                    var peer = targets[i];
+                    targets[i] = null!;
+                    SendWriterToPeer(peer, _writer, delivery, deliveryMethod, channel, message.Type, simActive);
+                }
+            }
+            finally
+            {
+                Array.Clear(targets, 0, n);
+                _broadcastTargets = targets;
+                NetworkMessages.Recycle(message, wireType != 0 ? wireType : (message.Type != NetworkMessageType.None ? (byte)message.Type : message.WireType));
+            }
         }
 
         private NetworkPeerState[]? _broadcastTargets;
@@ -450,17 +522,11 @@ namespace Krut.Netcode
             => NetworkMessagePool<T>.Rent();
 
         /// <summary>
-        /// Stops the network and releases resources. LiteNetLib sends the final packet only on the next
-        /// <c>PollEvents</c>, so without a pump loop here the explanation never reaches the client - the server
-        /// just closes the socket, and the client gets nothing but a silent loss that it later mistakenly
-        /// blames on its own network.
+        /// Stops the network without marking the session as permanently disposed, so a subclass's <c>Stop()</c>
+        /// allows a later <c>Start()</c> or <c>Connect()</c>.
         /// </summary>
-        public void Dispose()
+        protected void ShutdownSession()
         {
-            if (_disposed)
-                return;
-
-            _disposed = true;
             OnStopping();
             if (IsRunning)
             {
@@ -481,6 +547,22 @@ namespace Krut.Netcode
             // no longer mean anything.
             _delayQueue.Clear();
             IsRunning = false;
+            _unflushed = false;
+        }
+
+        /// <summary>
+        /// Stops the network and releases resources. LiteNetLib sends the final packet only on the next
+        /// <c>PollEvents</c>, so without a pump loop here the explanation never reaches the client - the server
+        /// just closes the socket, and the client gets nothing but a silent loss that it later mistakenly
+        /// blames on its own network.
+        /// </summary>
+        public void Dispose()
+        {
+            if (_disposed)
+                return;
+
+            ShutdownSession();
+            _disposed = true;
             GC.SuppressFinalize(this);
         }
 
@@ -504,7 +586,11 @@ namespace Krut.Netcode
             => IsRunning && _manager.SendUnconnectedMessage(data, to);
 
         /// <summary>Starts listening on <paramref name="port"/>.</summary>
-        protected bool StartListener(int port) => _manager.Start(port);
+        protected bool StartListener(int port)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _manager.Start(port);
+        }
 
         /// <summary>
         /// Starts listening/dialing on a specific IPv4 address (e.g. <c>127.0.0.1</c> for a local server, or a
@@ -512,6 +598,7 @@ namespace Krut.Netcode
         /// </summary>
         protected bool StartListener(string? address, int port)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             // LiteNetLib 2.x requires non-null addresses (unlike 1.x, where null meant "all"), so "all
             // addresses" becomes explicitly IPAddress.Any.
             var ipv4 = address is null ? System.Net.IPAddress.Any : System.Net.IPAddress.Parse(address);
@@ -569,6 +656,7 @@ namespace Krut.Netcode
         /// <summary>Removes a peer from the list and returns it (the object is still readable by the listeners).</summary>
         internal NetworkPeerState? RemovePeer(int peerId)
         {
+            _delayQueue.RemovePeer(peerId);
             if (!_peers.Remove(peerId, out var peer))
                 return null;
 
@@ -596,11 +684,11 @@ namespace Krut.Netcode
         /// the events cannot reach the game (and should not: a session that is shutting down must not get "peer
         /// joined" back after it said goodbye).
         /// </summary>
-        private void PumpDisconnectNotices()
+        internal void PumpDisconnectNotices()
         {
-            // Four rounds is enough: a final packet is sent in the first round and a peer leaves the shutdown
-            // list right after. The loop runs a fixed number of times (and not until the list is empty) so that
-            // it can never hang on an uncooperative peer.
+            // TriggerUpdate wakes LiteNetLib's update thread immediately so queued disconnect packets leave the
+            // socket before Stop() closes it.
+            _manager.TriggerUpdate();
             for (int i = 0; i < 4; i++)
                 _manager.PollEvents();
         }
@@ -653,19 +741,44 @@ namespace Krut.Netcode
                 message.Write(_writer);
 
                 byte channel = message.Channel;
+                var delivery = message.Delivery;
+                SendWriterToPeer(
+                    peer,
+                    _writer,
+                    delivery,
+                    NetworkChannels.ToDeliveryMethod(delivery),
+                    channel,
+                    message.Type,
+                    _simulation is { IsActive: true });
+            }
+            finally
+            {
+                if (recycle)
+                    NetworkMessages.Recycle(message, wireType != 0 ? wireType : (message.Type != NetworkMessageType.None ? (byte)message.Type : message.WireType));
+            }
+        }
 
+        private void SendWriterToPeer(
+            NetworkPeerState peer,
+            NetDataWriter writer,
+            NetworkDelivery delivery,
+            DeliveryMethod deliveryMethod,
+            byte channel,
+            NetworkMessageType messageType,
+            bool simActive)
+        {
+            try
+            {
                 // The packets being sent are the delayed ones, on both roles (see ApplySimulation). The bytes
                 // are copied first: _writer is reused by the next Send, so that a delayed packet cannot be
                 // overwritten by a later one.
-                if (_simulation is { IsActive: true })
+                if (simActive)
                 {
-                    _delayQueue.Enqueue(_simulation, peer, _writer, message.Delivery, channel);
-                    if (recycle)
-                        NetworkMessages.Recycle(message, wireType);
+                    _delayQueue.Enqueue(_simulation!, peer, writer, delivery, channel);
                     return;
                 }
 
-                peer.Peer.Send(_writer, channel, NetworkChannels.ToDeliveryMethod(message.Delivery));
+                peer.Peer.Send(writer, channel, deliveryMethod);
                 _unflushed = true;
             }
             catch (TooBigPacketException)
@@ -674,11 +787,8 @@ namespace Krut.Netcode
                 // packet (the MTU). The error must not crash the game - but it must be visible, otherwise the
                 // player silently loses motion.
                 Report(new NetworkError(NetworkErrorCode.PacketTooLarge,
-                    $"Message {message.Type} did not fit in a packet - split it up or use a reliable channel.", peer.Id));
+                    $"Message {messageType} did not fit in a packet - split it up or use a reliable channel.", peer.Id));
             }
-
-            if (recycle)
-                NetworkMessages.Recycle(message, wireType);
         }
 
         /// <summary>Moves the queue of incoming events so that they can be handled without the list changing during iteration.</summary>
@@ -747,52 +857,10 @@ namespace Krut.Netcode
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(networkEvent.Data!);
+                ReturnPacketBuffer(networkEvent.Data!);
             }
         }
 
-        /// <summary>
-        /// Decodes a message and forwards it to the game - including
-        /// protection against broken packets.
-        /// <para>
-        /// <b>How a packet becomes a pooled message.</b> The type byte is
-        /// looked up by its raw value (see the note below), the factory rents
-        /// an instance from that type's pool, the fields are read into it, and
-        /// it is handed to <see cref="MessageReceived"/> inside a
-        /// <see cref="NetworkEnvelope"/>. The instance goes back to the pool
-        /// in the <c>finally</c> below - <i>after</i> the handler returns, and
-        /// whether it returned normally or threw. So a handler that throws
-        /// cannot leak a pooled instance, and a handler that keeps the
-        /// reference gets the next message of that type instead, which is the
-        /// ownership rule spelled out on <see cref="MessageReceived"/>.
-        /// </para>
-        /// <para>
-        /// <b>What happens to a malformed or unknown message.</b> Neither
-        /// case ends the connection, and that is the whole design: a packet
-        /// this build cannot read is a protocol mismatch, not an attack, and
-        /// the rest of the session is still perfectly playable.
-        /// <list type="bullet">
-        /// <item><b>Empty</b> - the type byte could not be read at all.
-        /// Reported as <see cref="NetworkErrorCode.MalformedMessage"/>, counted
-        /// in <see cref="MalformedMessageCount"/>.</item>
-        /// <item><b>Unknown type byte</b> - reported as
-        /// <see cref="NetworkErrorCode.UnknownMessageType"/>, counted in
-        /// <see cref="UnknownMessageCount"/>, and the connection is kept. A
-        /// message this side doesn't understand must not kick a player out of
-        /// a match in progress.</item>
-        /// <item><b>Truncated body</b> - <c>Read</c> ran past the end of the
-        /// packet, i.e. the sender wrote more than it sent (bit error, or a
-        /// client on a different protocol build). The instance is recycled
-        /// <i>before</i> the report, so the pool stays balanced even on this
-        /// path, and the rest of the batch is unaffected: the next packet in
-        /// the same frame is decoded normally.</item>
-        /// <item><b>No handler</b> - the game didn't subscribe to
-        /// <see cref="MessageReceived"/>. The instance is recycled and
-        /// nothing is reported; an unobserved message is a game bug, not a
-        /// network fault.</item>
-        /// </list>
-        /// </para>
-        /// </summary>
         private void HandleMessage(NetworkEvent networkEvent)
         {
             try
@@ -801,7 +869,7 @@ namespace Krut.Netcode
             }
             finally
             {
-                ArrayPool<byte>.Shared.Return(networkEvent.Data!);
+                ReturnPacketBuffer(networkEvent.Data!);
             }
         }
 
@@ -833,7 +901,9 @@ namespace Krut.Netcode
                 return;
             }
 
-            if (IsServer && (message.Type == NetworkMessageType.Welcome || message.Type == NetworkMessageType.PlayerInfo))
+            if (IsServer && (message.Type == NetworkMessageType.Welcome
+                || message.Type == NetworkMessageType.SystemChat
+                || message.Type == NetworkMessageType.PlayerInfo))
             {
                 NetworkMessages.Recycle(message, typeByte);
                 MalformedMessageCount++;
@@ -852,6 +922,14 @@ namespace Krut.Netcode
                 NetworkMessages.Recycle(message, typeByte);
                 MalformedMessageCount++;
                 Report(new NetworkError(NetworkErrorCode.MalformedMessage, $"Could not decode message type {typeByte} - packet too short.", networkEvent.Peer!.Id));
+                return;
+            }
+
+            if (reader.AvailableBytes != 0)
+            {
+                NetworkMessages.Recycle(message, typeByte);
+                MalformedMessageCount++;
+                Report(new NetworkError(NetworkErrorCode.MalformedMessage, $"Could not decode message type {typeByte} - {reader.AvailableBytes} trailing bytes remained.", networkEvent.Peer!.Id));
                 return;
             }
 

@@ -17,6 +17,8 @@ namespace Krut.Netcode
     /// </summary>
     public sealed class NetworkDatagramSimLayer : PacketLayerBase
     {
+        private const int MaxLinks = 256;
+
         private readonly object _lock = new();
         private readonly List<PeerLink> _links = new();
         private readonly NetworkSimulationStats _stats = new();
@@ -25,6 +27,7 @@ namespace Krut.Netcode
         private NetworkSimulation? _dropOnly;
         private long _originTimestamp;
         private bool _clockStarted;
+        private int _nextLinkIndex;
 
         public NetworkDatagramSimLayer()
             : base(0)
@@ -46,6 +49,7 @@ namespace Krut.Netcode
                     _simulation = value;
                     _dropOnly = value is { DatagramLevel: true } ? value.ForDatagramStage() : null;
                     _links.Clear();
+                    _nextLinkIndex = 0;
                     _clockStarted = false;
                 }
             }
@@ -88,7 +92,10 @@ namespace Krut.Netcode
                     return _links[i].Model;
             }
 
-            var model = new NetworkLinkModel(_dropOnly!, _links.Count, _stats);
+            if (_links.Count >= MaxLinks)
+                _links.RemoveAt(0);
+
+            var model = new NetworkLinkModel(_dropOnly!, _nextLinkIndex++, _stats);
             _links.Add(new PeerLink(new IPEndPoint(endPoint.Address, endPoint.Port), model));
             return model;
         }

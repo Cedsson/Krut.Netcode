@@ -178,14 +178,22 @@ namespace Krut.Netcode
             }
 
             var peer = RemotePeer;
-            if (peer != null && !string.IsNullOrEmpty(reason))
+            if (peer != null)
             {
-                var notice = Rent<SystemChatMessage>();
-                notice.Text = reason!;
-                Send(peer.Id, notice);
+                if (!string.IsNullOrEmpty(reason))
+                {
+                    var writer = new NetDataWriter(true, 64);
+                    NetworkCodec.WriteText(writer, NetworkCodec.SanitizeText(reason));
+                    peer.Disconnect(writer);
+                }
+                else
+                {
+                    peer.Disconnect(null);
+                }
+
+                PumpDisconnectNotices();
             }
 
-            peer?.Disconnect(null);
             StopListener();
             SetRunning(false);
             SetLocalPeerId(-1);
@@ -199,7 +207,7 @@ namespace Krut.Netcode
         {
             _state = NetworkClientState.Offline;
             _attempts = 0;
-            Dispose();
+            ShutdownSession();
         }
 
         /// <summary>
@@ -215,7 +223,8 @@ namespace Krut.Netcode
             if (_state != NetworkClientState.Reconnecting)
                 return;
 
-            _reconnectTimer += deltaSeconds;
+            if (float.IsFinite(deltaSeconds) && deltaSeconds > 0f)
+                _reconnectTimer += deltaSeconds;
             if (_reconnectTimer < Config.ReconnectDelayMs / 1000f)
                 return;
 
@@ -272,8 +281,20 @@ namespace Krut.Netcode
             string text = DescribeReason(reason);
 
             // The server's own explanation wins over our generic text, no matter HOW the connection broke.
-            if (!info.AdditionalData.IsNull && info.AdditionalData.TryGetString(out var serverText) && !string.IsNullOrWhiteSpace(serverText))
-                text = serverText!;
+            if (!info.AdditionalData.IsNull && info.AdditionalData.AvailableBytes >= 2)
+            {
+                try
+                {
+                    string rawText = info.AdditionalData.GetString(NetworkCodec.MaxTextLength * 4);
+                    string sanitized = NetworkCodec.SanitizeText(rawText);
+                    if (!string.IsNullOrWhiteSpace(sanitized))
+                        text = sanitized;
+                }
+                catch (Exception)
+                {
+                    // Ignore malformed additional disconnect data and keep generic reason text.
+                }
+            }
 
             // The server's explanation is always more important than our own
             // - and on a rejection we must not try again (it would be
@@ -317,10 +338,15 @@ namespace Krut.Netcode
                 if (_state != NetworkClientState.Connecting)
                     return;
 
+                if (welcome.PeerId < 0 || welcome.TickRate <= 0 || welcome.ServerTick < 0)
+                {
+                    Report(new NetworkError(NetworkErrorCode.MalformedMessage, "Received invalid WelcomeMessage parameters from server.", envelope.PeerId));
+                    return;
+                }
+
                 SetLocalPeerId(welcome.PeerId);
                 PlayerName = welcome.PlayerName;
-                if (welcome.TickRate > 0)
-                    SetTickRate(welcome.TickRate);
+                SetTickRate(welcome.TickRate);
                 ResetClockTo(welcome.ServerTick);
                 _state = NetworkClientState.Connected;
                 SessionReady?.Invoke();

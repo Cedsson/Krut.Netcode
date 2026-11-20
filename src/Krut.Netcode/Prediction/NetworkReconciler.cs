@@ -664,7 +664,7 @@ namespace Krut.Netcode
         /// </param>
         public void UpdateRenderState(float deltaSeconds)
         {
-            if (!IsSmoothing)
+            if (!IsSmoothing || !float.IsFinite(deltaSeconds) || deltaSeconds <= 0f)
                 return;
 
             _smoothElapsed += deltaSeconds;

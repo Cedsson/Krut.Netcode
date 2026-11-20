@@ -44,6 +44,9 @@ namespace Krut.Netcode
         /// <summary>The server's tick when the peer connected (for lobby sorting: who was here first).</summary>
         public int JoinTick { get; internal set; }
 
+        /// <summary>True once the server has delivered the welcome and lobby sequence for this peer.</summary>
+        internal bool HasJoined { get; set; }
+
         /// <summary>
         /// The game's own data for the peer (e.g. a reference to the player's entity). <see cref="Tag"/> is the
         /// only field the library never touches - it is the game's slot, and the library neither reads nor clears

@@ -15,6 +15,7 @@ namespace Krut.Netcode
     {
         private const int UnreliableHeaderBytes = 1;
         private const int ChanneledHeaderBytes = 4;
+        private const int MaxLinks = 256;
 
         private readonly List<DelayedOutbound> _delayed = new();
         private readonly List<PeerLink> _links = new();
@@ -22,6 +23,7 @@ namespace Krut.Netcode
 
         private NetworkSimulation? _bound;
         private long _originTimestamp;
+        private int _nextLinkIndex;
 
         /// <summary>Messages dropped by the simulation, including reliable ones that were only delayed.</summary>
         public int DroppedCount => (int)_stats.Dropped;
@@ -49,12 +51,34 @@ namespace Krut.Netcode
             byte[] data = ArrayPool<byte>.Shared.Rent(length);
             Buffer.BlockCopy(writer.Data, 0, data, 0, length);
             var method = NetworkChannels.ToDeliveryMethod(delivery);
-            _delayed.Add(new DelayedOutbound(peer, data, length, channel, method, verdict.DueUs, reliable));
+            InsertSorted(new DelayedOutbound(peer, data, length, channel, method, verdict.DueUs, reliable));
             if (verdict.Duplicate)
             {
                 byte[] duplicateData = ArrayPool<byte>.Shared.Rent(length);
                 Buffer.BlockCopy(writer.Data, 0, duplicateData, 0, length);
-                _delayed.Add(new DelayedOutbound(peer, duplicateData, length, channel, method, verdict.DuplicateDueUs, reliable));
+                InsertSorted(new DelayedOutbound(peer, duplicateData, length, channel, method, verdict.DuplicateDueUs, reliable));
+            }
+        }
+
+        private void InsertSorted(in DelayedOutbound item)
+        {
+            int index = _delayed.Count;
+            while (index > 0 && _delayed[index - 1].DueUs > item.DueUs)
+                index--;
+
+            if (index == _delayed.Count)
+                _delayed.Add(item);
+            else
+                _delayed.Insert(index, item);
+        }
+
+        /// <summary>Removes link state for a disconnected peer so repeated reconnects do not accumulate stale entries.</summary>
+        public void RemovePeer(int peerId)
+        {
+            for (int i = _links.Count - 1; i >= 0; i--)
+            {
+                if (_links[i].Peer.Id == peerId)
+                    _links.RemoveAt(i);
             }
         }
 
@@ -83,11 +107,12 @@ namespace Krut.Netcode
 
             _delayed.Clear();
             _links.Clear();
+            _nextLinkIndex = 0;
             _bound = null;
         }
 
         /// <summary>
-        /// Sends the packets whose due time has passed, in the order they were queued, and removes them. A packet
+        /// Sends the packets whose due time has passed, in chronological <c>DueUs</c> order, and removes them. A packet
         /// that falls due inside an outage is lost (unreliable) or held until the outage ends (reliable).
         /// </summary>
         public bool FlushDue()
@@ -99,6 +124,7 @@ namespace Krut.Netcode
             long outageEnd = 0;
             bool inOutage = !_bound.DatagramLevel && _bound.TryGetOutage(now, out outageEnd);
             bool sent = false;
+            bool outageRescheduled = false;
             int kept = 0;
             for (int i = 0; i < _delayed.Count; i++)
             {
@@ -115,6 +141,7 @@ namespace Krut.Netcode
                     {
                         delayed.DueUs = outageEnd;
                         _delayed[kept++] = delayed;
+                        outageRescheduled = true;
                     }
                     else
                     {
@@ -138,6 +165,8 @@ namespace Krut.Netcode
             }
 
             _delayed.RemoveRange(kept, _delayed.Count - kept);
+            if (outageRescheduled && _delayed.Count > 1)
+                _delayed.Sort(static (a, b) => a.DueUs.CompareTo(b.DueUs));
             return sent;
         }
 
@@ -149,6 +178,7 @@ namespace Krut.Netcode
             _bound = simulation;
             _originTimestamp = Stopwatch.GetTimestamp();
             _links.Clear();
+            _nextLinkIndex = 0;
         }
 
         private NetworkLinkModel LinkFor(NetworkPeerState peer)
@@ -159,7 +189,10 @@ namespace Krut.Netcode
                     return _links[i].Model;
             }
 
-            var model = new NetworkLinkModel(_bound!, _links.Count, _stats);
+            if (_links.Count >= MaxLinks)
+                _links.RemoveAt(0);
+
+            var model = new NetworkLinkModel(_bound!, _nextLinkIndex++, _stats);
             _links.Add(new PeerLink(peer, model));
             return model;
         }

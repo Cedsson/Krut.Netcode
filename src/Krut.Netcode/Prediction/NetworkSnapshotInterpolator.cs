@@ -250,16 +250,28 @@ namespace Krut.Netcode
             mode = NetworkSampleMode.Empty;
             _lastRenderTick = renderTick;
 
-            if (_snapshots.IsEmpty)
+            if (_snapshots.IsEmpty || !double.IsFinite(renderTick))
             {
                 LastSampleMode = NetworkSampleMode.Empty;
                 return false;
             }
 
-            int floorTick = (int)Math.Floor(renderTick);
-            int lower = _snapshots.IndexOfTickAtOrBefore(floorTick);
+            double floored = Math.Floor(renderTick);
 
             // The future in the buffer: the moment in question lies BEFORE the oldest we have.
+            if (floored < _snapshots.OldestTick)
+            {
+                state = _snapshots[0].Value;
+                mode = NetworkSampleMode.Held;
+                LastSampleMode = mode;
+                return true;
+            }
+
+            if (floored > _snapshots.NewestTick)
+                return TryExtrapolate(renderTick, out state, out mode);
+
+            int floorTick = (int)floored;
+            int lower = _snapshots.IndexOfTickAtOrBefore(floorTick);
             if (lower < 0)
             {
                 state = _snapshots[0].Value;
@@ -268,7 +280,7 @@ namespace Krut.Netcode
                 return true;
             }
 
-            int lowerTick = _snapshots[lower].Tick;
+            int lowerTick = _snapshots.GetTick(lower);
 
             // Exact hit: a snapshot for exactly this tick, and we asked about exactly that.
             if (lowerTick == floorTick && renderTick == floorTick)
@@ -283,7 +295,7 @@ namespace Krut.Netcode
             {
                 TState a = _snapshots[lower].Value;
                 TState b = _snapshots[lower + 1].Value;
-                int tickB = _snapshots[lower + 1].Tick;
+                int tickB = _snapshots.GetTick(lower + 1);
 
                 // The fraction between the two points, i.e. 0..1 - renderTick lies here by definition between
                 // tickA and tickB. tickB - tickA can be greater than 1 if a snapshot was lost; then the

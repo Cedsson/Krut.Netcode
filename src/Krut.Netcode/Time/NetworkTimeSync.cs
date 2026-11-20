@@ -308,8 +308,16 @@ namespace Krut.Netcode
         /// Measured round-trip time in seconds. Must be finite and 0 or greater; a negative or non-finite value
         /// is discarded as junk.
         /// </param>
-        public void RecordResponse(int clientTickAtSend, int serverTick, double roundTripSeconds) =>
+        public void RecordResponse(int clientTickAtSend, int serverTick, double roundTripSeconds)
+        {
+            while (_pendingCount > 0 && _pendingTicks[_pendingHead] <= clientTickAtSend)
+            {
+                _pendingHead = (_pendingHead + 1) % SampleCapacity;
+                _pendingCount--;
+            }
+
             AddSample(clientTickAtSend, serverTick, roundTripSeconds);
+        }
 
         /// <summary>
         /// Should a new sample be sent now? True every <see cref="RecommendedProbeIntervalTicks"/> tick, and

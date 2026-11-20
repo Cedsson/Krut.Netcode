@@ -77,7 +77,7 @@ namespace Krut.Netcode
         /// </summary>
         public void Advance(float deltaSeconds, Action onTick)
         {
-            if (deltaSeconds > 0f)
+            if (float.IsFinite(deltaSeconds) && deltaSeconds > 0f)
             {
                 _accumulator += deltaSeconds;
                 int released = 0;

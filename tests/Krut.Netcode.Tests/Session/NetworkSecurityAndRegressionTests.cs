@@ -149,19 +149,33 @@ namespace Krut.Netcode.Tests
             spoofInfo.PlayerName = "Spoof";
             client.Send(client.ServerPeerId, spoofInfo);
 
-            // Queue a 0-byte received payload as LiteNetLib would for an empty header-only datagram.
+            var spoofSystemChat = NetworkSession.Rent<SystemChatMessage>();
+            spoofSystemChat.Text = "Admin announcement";
+            client.Send(client.ServerPeerId, spoofSystemChat);
+
+            // Queue a 0-byte received payload and a trailing-bytes payload.
             foreach (var peer in server.Peers)
             {
                 server.PendingEvents.Add(NetworkEvent.Received(peer.Peer, ArrayPool<byte>.Shared.Rent(0), 0, NetworkDelivery.Unreliable));
+
+                var trailingWriter = new NetDataWriter(true, 64);
+                trailingWriter.Put((byte)NetworkMessageType.Chat);
+                NetworkCodec.WriteText(trailingWriter, "valid");
+                trailingWriter.Put(12345); // Extra trailing unread bytes
+                byte[] trailingBuf = ArrayPool<byte>.Shared.Rent(trailingWriter.Length);
+                Buffer.BlockCopy(trailingWriter.Data, 0, trailingBuf, 0, trailingWriter.Length);
+                server.PendingEvents.Add(NetworkEvent.Received(peer.Peer, trailingBuf, trailingWriter.Length, NetworkDelivery.ReliableOrdered));
                 break;
             }
             server.Update(1f / 60f);
 
-            Require(PumpUntil(3f, () => server.MalformedMessageCount >= 3, server, client),
-                "Server did not count spoofed and empty messages as malformed",
+            Require(PumpUntil(3f, () => server.MalformedMessageCount >= 5, server, client),
+                "Server did not count spoofed, empty, and trailing-byte messages as malformed",
                 $"count {server.MalformedMessageCount}");
             Require(!serverReceivedTypes.Contains(NetworkMessageType.Welcome), "Server delivered client-sent Welcome");
             Require(!serverReceivedTypes.Contains(NetworkMessageType.PlayerInfo), "Server delivered client-sent PlayerInfo");
+            Require(!serverReceivedTypes.Contains(NetworkMessageType.SystemChat), "Server delivered client-sent SystemChat");
+            Require(!serverReceivedTypes.Contains(NetworkMessageType.Chat), "Server delivered Chat message with trailing unread bytes");
             Require(serverErrors.Exists(e => e.Code == NetworkErrorCode.MalformedMessage), "No MalformedMessage error reported");
         }
 
@@ -294,6 +308,185 @@ namespace Krut.Netcode.Tests
             using var client = new NetworkClient(Config(server.Port));
             Require(client.Connect("127.0.0.1", server.Port, "PortZeroClient"), "Client could not connect to bound port");
             Require(WaitUntilReady(5f, client, server, client), "Client did not become ready on ephemeral port");
+        }
+
+        [Fact]
+        public void ConnectionApproval_StillEnforcesMaxClients_AndSanitizesDisconnectText()
+        {
+            using var server = new NetworkServer(Config(0, maxClients: 1));
+            server.ConnectionApproval = req =>
+                req.PlayerName == "Banned"
+                    ? NetworkConnectionResult.Reject("Banned\u202E\x07!")
+                    : NetworkConnectionResult.Accept();
+            Require(server.Start(), "Server failed to start");
+
+            using var banned = new NetworkClient(Config(server.Port));
+            string bannedText = string.Empty;
+            banned.Closed += (_, text) => bannedText = text;
+            Require(banned.Connect("127.0.0.1", server.Port, "Banned"), "Banned client could not send connect");
+            Require(PumpUntil(4f, () => bannedText.Length > 0, server, banned), "Banned client did not receive rejection");
+            Require(bannedText == "Banned!", "Rejection text was not sanitized on client", $"'{bannedText}'");
+
+            using var first = new NetworkClient(Config(server.Port));
+            Require(first.Connect("127.0.0.1", server.Port, "First"), "First client could not connect");
+            Require(WaitUntilReady(5f, first, server, first), "First client never became ready");
+
+            using var second = new NetworkClient(Config(server.Port));
+            string fullText = string.Empty;
+            second.Closed += (_, text) => fullText = text;
+            Require(second.Connect("127.0.0.1", server.Port, "Second"), "Second client could not send connect");
+            Require(PumpUntil(4f, () => fullText.Length > 0, server, first, second), "Second client was not rejected by MaxClients when ConnectionApproval was set");
+            Require(fullText.Contains("full", StringComparison.OrdinalIgnoreCase), "Expected full lobby rejection", $"'{fullText}'");
+            Require(server.ClientCount == 1, "MaxClients was bypassed via ConnectionApproval", server.ClientCount.ToString());
+        }
+
+        [Fact]
+        public void Clock_Interpolator_AndReconciler_IgnoreNonFiniteInputs_WithoutNaNPoisoning()
+        {
+            var clock = new NetworkClock(60, 5);
+            int ticks = 0;
+            clock.Advance(float.PositiveInfinity, () => ticks++);
+            clock.Advance(float.NaN, () => ticks++);
+            clock.Advance(-5f, () => ticks++);
+            Require(ticks == 0 && float.IsFinite(clock.TickProgress), "Non-finite delta poisoned NetworkClock", $"ticks {ticks}, progress {clock.TickProgress}");
+
+            clock.Advance(1f / 60f, () => ticks++);
+            Require(ticks == 1, "NetworkClock did not advance after non-finite inputs", ticks.ToString());
+
+            var interpolator = new NetworkSnapshotInterpolator<VecState>(2);
+            interpolator.Push(10, new VecState { X = 10f });
+            interpolator.Push(20, new VecState { X = 20f });
+
+            Require(!interpolator.TrySampleTime(double.NaN, out _), "NaN renderTick should return false");
+            Require(!interpolator.TrySampleTime(double.PositiveInfinity, out _), "+Infinity renderTick should return false");
+            Require(!interpolator.TrySampleTime(double.NegativeInfinity, out _), "-Infinity renderTick should return false");
+            Require(interpolator.TrySampleTime(-1e15, out var heldPast, out var pastMode) && pastMode == NetworkSampleMode.Held && heldPast.X == 10f,
+                "Large negative renderTick overflowed int");
+            Require(interpolator.TrySampleTime(1e15, out var heldFuture, out var futureMode) && futureMode == NetworkSampleMode.Held && heldFuture.X == 20f,
+                "Large positive renderTick overflowed int");
+
+            var sync = new NetworkTimeSync(60);
+            sync.RecordRequest(10);
+            sync.RecordRequest(18);
+            Require(sync.PendingRequestCount == 2, "Expected 2 pending requests");
+            sync.RecordResponse(10, 100, 0.02);
+            Require(sync.PendingRequestCount == 1, "3-argument RecordResponse did not retire matching pending request", sync.PendingRequestCount.ToString());
+        }
+
+        [Fact]
+        public void Stop_DeliversShutdownReason_AndAllowsRestart_WhileDisposeThrows()
+        {
+            int port = FreeUdpPort();
+            using var server = new NetworkServer(Config(port, maxClients: 2));
+            Require(server.Start(), "Server failed to start");
+
+            using var client = new NetworkClient(Config(port));
+            Require(client.Connect("127.0.0.1", port, "RestartClient"), "Client failed to connect");
+            Require(WaitUntilReady(5f, client, server, client), "Client did not become ready");
+
+            string shutdownReason = string.Empty;
+            client.Closed += (_, text) => shutdownReason = text;
+            server.Stop();
+
+            Require(PumpUntil(4f, () => shutdownReason.Length > 0, server, client), "Client did not receive shutdown disconnect");
+            Require(shutdownReason.Contains("shutting down", StringComparison.OrdinalIgnoreCase),
+                "Shutdown reason did not reach client", $"'{shutdownReason}'");
+
+            client.Stop();
+            Require(server.Start(), "Server could not restart after Stop()");
+            Require(client.Connect("127.0.0.1", port, "RestartClient"), "Client could not reconnect after Stop()");
+            Require(WaitUntilReady(5f, client, server, client), "Restarted session did not become ready");
+
+            client.Dispose();
+            server.Dispose();
+            Assert.Throws<ObjectDisposedException>(() => server.Start());
+            Assert.Throws<ObjectDisposedException>(() => client.Connect("127.0.0.1", port));
+        }
+
+        private const byte BroadcastCounterWire = 239;
+
+        private sealed class BroadcastCounterMessage : INetworkMessage
+        {
+            public static int WriteCount;
+
+            public NetworkMessageType Type => NetworkMessageType.None;
+            public byte WireType => BroadcastCounterWire;
+            public NetworkDelivery Delivery => NetworkDelivery.ReliableOrdered;
+
+            public int Value;
+
+            public void Reset() => Value = 0;
+
+            public void Write(NetDataWriter writer)
+            {
+                System.Threading.Interlocked.Increment(ref WriteCount);
+                writer.Put(Value);
+            }
+
+            public void Read(NetDataReader reader) => Value = reader.GetInt();
+        }
+
+        [Fact]
+        public void Broadcast_SerializesOnceForMultiplePeers_AndPoolSurvivesTrackedOverflow()
+        {
+            if (!NetworkMessages.IsRegistered(BroadcastCounterWire))
+                NetworkMessages.RegisterGameMessage<BroadcastCounterMessage>(BroadcastCounterWire, NetworkDelivery.ReliableOrdered);
+
+            // Leak > 4096 rented instances to exceed MaxTracked, then verify an active rented instance still resets & recycles.
+            for (int i = 0; i < 4200; i++)
+                _ = NetworkSession.Rent<BroadcastCounterMessage>();
+
+            var active = NetworkSession.Rent<BroadcastCounterMessage>();
+            active.Value = 777;
+            NetworkMessages.Recycle(active, BroadcastCounterWire);
+            var reused = NetworkSession.Rent<BroadcastCounterMessage>();
+            Require(ReferenceEquals(active, reused) && reused.Value == 0,
+                "Pool failed to reset or recycle after MaxTracked overflow", $"same={ReferenceEquals(active, reused)}, val={reused.Value}");
+            NetworkMessages.Recycle(reused, BroadcastCounterWire);
+
+            using var server = new NetworkServer(Config(0, maxClients: 3));
+            Require(server.Start(), "Server failed to start");
+
+            using var c1 = new NetworkClient(Config(server.Port));
+            using var c2 = new NetworkClient(Config(server.Port));
+            int received = 0;
+            c1.MessageReceived += e => { if (e.Message is BroadcastCounterMessage m && m.Value == 42) received++; };
+            c2.MessageReceived += e => { if (e.Message is BroadcastCounterMessage m && m.Value == 42) received++; };
+
+            Require(c1.Connect("127.0.0.1", server.Port, "C1") && c2.Connect("127.0.0.1", server.Port, "C2"), "Clients could not connect");
+            Require(WaitUntilAllReady(5f, new[] { c1, c2 }, server, c1, c2), "Clients did not become ready");
+
+            BroadcastCounterMessage.WriteCount = 0;
+            var msg = NetworkSession.Rent<BroadcastCounterMessage>();
+            msg.Value = 42;
+            server.Broadcast(msg);
+
+            Require(BroadcastCounterMessage.WriteCount == 1,
+                "Broadcast serialized the message more than once across multiple recipients",
+                BroadcastCounterMessage.WriteCount.ToString());
+            Require(PumpUntil(3f, () => received == 2, server, c1, c2),
+                "Not all recipients received single-serialized broadcast", received.ToString());
+        }
+
+        [Fact]
+        public void Unconnected_OversizedPayload_IsRejectedAndCountedAsMalformed()
+        {
+            var serverConfig = Config(0, maxClients: 1);
+            serverConfig.UnconnectedMessages = true;
+            using var server = new NetworkServer(serverConfig);
+            int received = 0;
+            server.UnconnectedReceived += (_, _) => received++;
+            Require(server.Start(), "Server failed to start");
+
+            var oversized = new NetDataWriter(true, NetworkSession.MaxUnconnectedMessageBytes + 100);
+            oversized.Put(new byte[NetworkSession.MaxUnconnectedMessageBytes + 50]);
+            var reader = new NetDataReader(oversized.Data, 0, oversized.Length);
+
+            server.EnqueueUnconnected(new IPEndPoint(IPAddress.Loopback, 12345), reader);
+            server.Update(1f / 60f);
+
+            Require(received == 0, "Oversized unconnected payload was delivered");
+            Require(server.MalformedMessageCount == 1, "Oversized unconnected payload was not counted as malformed", server.MalformedMessageCount.ToString());
         }
 
         private static byte[] BuildWriterPayload(Action<NetDataWriter> write)
