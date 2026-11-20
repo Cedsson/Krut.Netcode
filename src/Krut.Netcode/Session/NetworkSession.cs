@@ -275,13 +275,25 @@ namespace Krut.Netcode
             _pending.Add(NetworkEvent.Received(peer, buffer, length, delivery));
         }
 
+        /// <summary>Copies an unconnected datagram into a pooled buffer and queues it for <see cref="DrainEvents"/>.</summary>
+        internal void EnqueueUnconnected(System.Net.IPEndPoint endPoint, NetPacketReader reader)
+        {
+            int length = reader.AvailableBytes;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(length);
+            reader.GetRemainingBytesSpan().CopyTo(buffer);
+            _pending.Add(NetworkEvent.Unconnected(endPoint, buffer, length));
+        }
+
         /// <summary>Gives the pooled receive buffers of queued events back to the pool.</summary>
         private static void ReleaseBuffers(List<NetworkEvent> events)
         {
             foreach (var networkEvent in events)
             {
-                if (networkEvent.Kind == NetworkEventKind.Received && networkEvent.Data is { } data)
+                if ((networkEvent.Kind == NetworkEventKind.Received || networkEvent.Kind == NetworkEventKind.Unconnected)
+                    && networkEvent.Data is { } data)
+                {
                     ArrayPool<byte>.Shared.Return(data);
+                }
             }
         }
 
@@ -484,14 +496,12 @@ namespace Krut.Netcode
         /// </summary>
         public event Action<System.Net.IPEndPoint, byte[]>? UnconnectedReceived;
 
-        internal void RaiseUnconnected(System.Net.IPEndPoint from, byte[] data) => UnconnectedReceived?.Invoke(from, data);
-
         /// <summary>
         /// Sends one unconnected datagram from this session's own socket to <paramref name="to"/> - the same
         /// socket the peers use, which is the point for NAT punch-through.
         /// </summary>
         public bool SendUnconnected(System.Net.IPEndPoint to, ReadOnlySpan<byte> data)
-            => IsRunning && _manager.SendUnconnectedMessage(data.ToArray(), to);
+            => IsRunning && _manager.SendUnconnectedMessage(data, to);
 
         /// <summary>Starts listening on <paramref name="port"/>.</summary>
         protected bool StartListener(int port) => _manager.Start(port);
@@ -532,6 +542,13 @@ namespace Krut.Netcode
 
         /// <summary>Marks the peer id this side has (the client, from <see cref="NetworkMessageType.Welcome"/>).</summary>
         internal void SetLocalPeerId(int peerId) => LocalPeerId = peerId;
+
+        /// <summary>Updates the session's tick rate (clamped to 1..240 Hz), e.g. from <see cref="WelcomeMessage.TickRate"/>.</summary>
+        internal void SetTickRate(int tickRate)
+        {
+            Config.TickRate = Math.Clamp(tickRate, 1, 240);
+            _clock.SetTickRate(Config.TickRate);
+        }
 
         /// <summary>
         /// Jumps the clock to <paramref name="serverTick"/>, which a client does when its
@@ -635,18 +652,20 @@ namespace Krut.Netcode
                 _writer.Put(wireType);
                 message.Write(_writer);
 
+                byte channel = message.Channel;
+
                 // The packets being sent are the delayed ones, on both roles (see ApplySimulation). The bytes
                 // are copied first: _writer is reused by the next Send, so that a delayed packet cannot be
                 // overwritten by a later one.
                 if (_simulation is { IsActive: true })
                 {
-                    _delayQueue.Enqueue(_simulation, peer, _writer, message.Delivery);
+                    _delayQueue.Enqueue(_simulation, peer, _writer, message.Delivery, channel);
                     if (recycle)
                         NetworkMessages.Recycle(message, wireType);
                     return;
                 }
 
-                peer.Peer.Send(_writer, NetworkChannels.For(message.Delivery), NetworkChannels.ToDeliveryMethod(message.Delivery));
+                peer.Peer.Send(_writer, channel, NetworkChannels.ToDeliveryMethod(message.Delivery));
                 _unflushed = true;
             }
             catch (TooBigPacketException)
@@ -702,6 +721,9 @@ namespace Krut.Netcode
                         // delay on the other side.
                         HandleMessage(networkEvent);
                         break;
+                    case NetworkEventKind.Unconnected:
+                        HandleUnconnected(networkEvent);
+                        break;
                     case NetworkEventKind.SocketError:
                         Report(new NetworkError(NetworkErrorCode.Socket, $"Network error: {networkEvent.Error}.", endPoint: networkEvent.EndPoint));
                         break;
@@ -709,6 +731,24 @@ namespace Krut.Netcode
             }
 
             _draining.Clear();
+        }
+
+        private void HandleUnconnected(NetworkEvent networkEvent)
+        {
+            try
+            {
+                var handler = UnconnectedReceived;
+                if (handler is null)
+                    return;
+
+                byte[] copy = new byte[networkEvent.Length];
+                Buffer.BlockCopy(networkEvent.Data!, 0, copy, 0, networkEvent.Length);
+                handler.Invoke(networkEvent.EndPoint!, copy);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(networkEvent.Data!);
+            }
         }
 
         /// <summary>
@@ -773,6 +813,7 @@ namespace Krut.Netcode
             byte typeByte;
             if (!reader.TryGetByte(out typeByte))
             {
+                MalformedMessageCount++;
                 Report(new NetworkError(NetworkErrorCode.MalformedMessage, "Empty message received.", networkEvent.Peer!.Id));
                 return;
             }
@@ -782,13 +823,21 @@ namespace Krut.Netcode
             // NetworkMessageType. That is the only difference from the earlier Create(type) call, and it is the
             // whole point: the library must not need to know a single game type for game traffic to be
             // delivered.
-            var message = NetworkMessages.CreateFromWire(typeByte, out var registeredDelivery);
+            var message = NetworkMessages.CreateFromWire(typeByte, out _);
             if (message is null)
             {
                 // Either a newer-version client or a broken header. It is reported, but the connection is kept:
                 // a message this side doesn't understand must not kick a player out of a match in progress.
                 UnknownMessageCount++;
                 Report(new NetworkError(NetworkErrorCode.UnknownMessageType, $"Unknown message type {typeByte}.", networkEvent.Peer!.Id));
+                return;
+            }
+
+            if (IsServer && (message.Type == NetworkMessageType.Welcome || message.Type == NetworkMessageType.PlayerInfo))
+            {
+                NetworkMessages.Recycle(message, typeByte);
+                MalformedMessageCount++;
+                Report(new NetworkError(NetworkErrorCode.MalformedMessage, $"Client sent a server-only message type {typeByte}.", networkEvent.Peer!.Id));
                 return;
             }
 

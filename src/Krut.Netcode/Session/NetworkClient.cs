@@ -56,6 +56,9 @@ namespace Krut.Netcode
         /// <summary>The state the client is in.</summary>
         private NetworkClientState _state = NetworkClientState.Offline;
 
+        /// <summary>Cached server peer id so hot-path sends do not enumerate the peer dictionary.</summary>
+        private int _serverPeerId = -1;
+
         /// <param name="config">Settings to run with, or null for the defaults (see <see cref="NetworkConfig"/>). Copied, so changing your own instance afterwards has no effect on the running client.</param>
         public NetworkClient(NetworkConfig? config = null)
             : base(config ?? new NetworkConfig(), isServer: false)
@@ -84,7 +87,7 @@ namespace Krut.Netcode
         public string PlayerName { get; private set; } = "Player";
 
         /// <summary>The server's peer id (only a client has one).</summary>
-        public int ServerPeerId => RemotePeer?.Id ?? -1;
+        public int ServerPeerId => _serverPeerId >= 0 ? _serverPeerId : (RemotePeer?.Id ?? -1);
 
         /// <summary>
         /// The welcome message has arrived and the session is ready: peer id, tick rate and name are set.
@@ -186,6 +189,7 @@ namespace Krut.Netcode
             StopListener();
             SetRunning(false);
             SetLocalPeerId(-1);
+            _serverPeerId = -1;
             _state = NetworkClientState.Offline;
             _attempts = 0;
         }
@@ -229,7 +233,11 @@ namespace Krut.Netcode
         /// The peer object exists, but the session is not ready yet: the peer id and the server's tick come in
         /// the welcome message, which can arrive a frame after the UDP connection became official.
         /// </summary>
-        protected override void OnPeerConnectedEvent(NetworkPeerState peer) => base.OnPeerConnectedEvent(peer);
+        protected override void OnPeerConnectedEvent(NetworkPeerState peer)
+        {
+            _serverPeerId = peer.Id;
+            base.OnPeerConnectedEvent(peer);
+        }
 
         /// <inheritdoc/>
         /// <para>
@@ -258,6 +266,7 @@ namespace Krut.Netcode
         {
             base.OnPeerDisconnectedEvent(peer, info);
             SetLocalPeerId(-1);
+            _serverPeerId = -1;
 
             var reason = info.Reason;
             string text = DescribeReason(reason);
@@ -294,18 +303,24 @@ namespace Krut.Netcode
         protected override void OnStopping()
         {
             base.OnStopping();
+            _serverPeerId = -1;
             _state = NetworkClientState.Offline;
         }
 
         /// <summary>
-        /// Listens for the server's messages: the welcome message sets the peer id, the tick and the name.
+        /// Listens for the server's messages: the welcome message sets the peer id, the tick rate, the tick and the name.
         /// </summary>
         private void HandleMessage(NetworkEnvelope envelope)
         {
             if (envelope.Message is WelcomeMessage welcome)
             {
+                if (_state != NetworkClientState.Connecting)
+                    return;
+
                 SetLocalPeerId(welcome.PeerId);
                 PlayerName = welcome.PlayerName;
+                if (welcome.TickRate > 0)
+                    SetTickRate(welcome.TickRate);
                 ResetClockTo(welcome.ServerTick);
                 _state = NetworkClientState.Connected;
                 SessionReady?.Invoke();

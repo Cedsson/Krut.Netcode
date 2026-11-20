@@ -47,8 +47,8 @@ namespace Krut.Netcode
         /// <summary>Number of clients connected right now.</summary>
         public int ClientCount => ConnectedPeerCount;
 
-        /// <summary>The port the server listens on (0 before <see cref="Start"/> has run, and the chosen port afterwards).</summary>
-        public int Port => Config.Port;
+        /// <summary>The port the server listens on (the bound port while running, else the configured port).</summary>
+        public int Port => IsRunning ? BoundPort : Config.Port;
 
         /// <summary>Who gets to come in.</summary>
         public Func<NetworkConnectionRequest, NetworkConnectionResult>? ConnectionApproval { get; set; }
@@ -81,6 +81,8 @@ namespace Krut.Netcode
 
             _started = false;
             Dispose();
+            foreach (var info in _playerInfo.Values)
+                NetworkMessages.Recycle(info);
             _playerInfo.Clear();
         }
 
@@ -177,9 +179,10 @@ namespace Krut.Netcode
             // accepted (rejected app id, wrong version, full lobby) also gives a PeerDisconnected, but without
             // it ever having been in the lobby - writing "Player left" in the log for every stray process on
             // the port would be spam, and a player would see their own "joined" line disappear right away.
-            if (!_playerInfo.Remove(peer.Id))
+            if (!_playerInfo.Remove(peer.Id, out var removed))
                 return;
 
+            NetworkMessages.Recycle(removed);
             BroadcastSystemChat($"{peer.Name} left ({DescribeReason(info.Reason)}).");
         }
 
@@ -234,10 +237,44 @@ namespace Krut.Netcode
 
             if (data != null && !data.IsNull)
             {
-                applicationId = data.GetString() ?? string.Empty;
-                data.TryGetInt(out protocolVersion);
-                if (data.TryGetString(out var sentName))
-                    name = sentName!;
+                try
+                {
+                    if (data.AvailableBytes < 2)
+                    {
+                        request.Reject();
+                        return;
+                    }
+
+                    int maxAppIdLength = Math.Max(256, Config.ApplicationId.Length);
+                    applicationId = data.GetString(maxAppIdLength) ?? string.Empty;
+                    if (applicationId != Config.ApplicationId)
+                    {
+                        // Wrong game on the same port - answer silently (the other
+                        // app has nothing to do with our error message).
+                        request.Reject();
+                        return;
+                    }
+
+                    if (!data.TryGetInt(out protocolVersion))
+                    {
+                        request.Reject();
+                        return;
+                    }
+
+                    if (protocolVersion != Config.ProtocolVersion)
+                    {
+                        request.Reject(Reason($"Protocol version {protocolVersion} does not match the server's {Config.ProtocolVersion} - update the game."));
+                        return;
+                    }
+
+                    if (data.AvailableBytes > 0)
+                        name = data.GetString(NetworkCodec.MaxNameLength * 8) ?? "Player";
+                }
+                catch (Exception)
+                {
+                    request.Reject();
+                    return;
+                }
             }
 
             if (applicationId != Config.ApplicationId)

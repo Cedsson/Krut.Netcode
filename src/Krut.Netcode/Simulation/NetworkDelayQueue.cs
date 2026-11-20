@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using LiteNetLib.Utils;
@@ -34,7 +35,7 @@ namespace Krut.Netcode
         /// Queues a sent message according to the link's verdict, or discards it. The decision is taken before
         /// the bytes are copied: a message that never got away should not cost a copy.
         /// </summary>
-        public void Enqueue(NetworkSimulation simulation, NetworkPeerState peer, NetDataWriter writer, NetworkDelivery delivery)
+        public void Enqueue(NetworkSimulation simulation, NetworkPeerState peer, NetDataWriter writer, NetworkDelivery delivery, byte channel)
         {
             Bind(simulation);
             bool reliable = delivery != NetworkDelivery.Unreliable;
@@ -43,27 +44,43 @@ namespace Krut.Netcode
             if (!verdict.Deliver)
                 return;
 
-            // Own array instead of a reference to writer.Data: the writer is reused by the next Send.
-            var data = new byte[writer.Length];
-            Array.Copy(writer.Data, data, writer.Length);
-            byte channel = NetworkChannels.For(delivery);
+            // Pooled array copy instead of a reference to writer.Data: the writer is reused by the next Send.
+            int length = writer.Length;
+            byte[] data = ArrayPool<byte>.Shared.Rent(length);
+            Buffer.BlockCopy(writer.Data, 0, data, 0, length);
             var method = NetworkChannels.ToDeliveryMethod(delivery);
-            _delayed.Add(new DelayedOutbound(peer, data, channel, method, verdict.DueUs, reliable));
+            _delayed.Add(new DelayedOutbound(peer, data, length, channel, method, verdict.DueUs, reliable));
             if (verdict.Duplicate)
-                _delayed.Add(new DelayedOutbound(peer, data, channel, method, verdict.DuplicateDueUs, reliable));
+            {
+                byte[] duplicateData = ArrayPool<byte>.Shared.Rent(length);
+                Buffer.BlockCopy(writer.Data, 0, duplicateData, 0, length);
+                _delayed.Add(new DelayedOutbound(peer, duplicateData, length, channel, method, verdict.DuplicateDueUs, reliable));
+            }
         }
 
         /// <summary>Sends every queued packet now; used when the simulation is switched off.</summary>
         public void SendAll()
         {
             foreach (var delayed in _delayed)
-                delayed.Peer.Peer.Send(delayed.Data, delayed.Channel, delayed.Method);
+            {
+                try
+                {
+                    delayed.Peer.Peer.Send(delayed.Data, 0, delayed.Length, delayed.Channel, delayed.Method);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(delayed.Data);
+                }
+            }
 
             _delayed.Clear();
         }
 
         public void Clear()
         {
+            foreach (var delayed in _delayed)
+                ArrayPool<byte>.Shared.Return(delayed.Data);
+
             _delayed.Clear();
             _links.Clear();
             _bound = null;
@@ -101,6 +118,7 @@ namespace Krut.Netcode
                     }
                     else
                     {
+                        ArrayPool<byte>.Shared.Return(delayed.Data);
                         _stats.Dropped++;
                         _stats.DroppedOutage++;
                     }
@@ -108,8 +126,15 @@ namespace Krut.Netcode
                     continue;
                 }
 
-                delayed.Peer.Peer.Send(delayed.Data, delayed.Channel, delayed.Method);
-                sent = true;
+                try
+                {
+                    delayed.Peer.Peer.Send(delayed.Data, 0, delayed.Length, delayed.Channel, delayed.Method);
+                    sent = true;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(delayed.Data);
+                }
             }
 
             _delayed.RemoveRange(kept, _delayed.Count - kept);
@@ -164,10 +189,11 @@ namespace Krut.Netcode
         /// </summary>
         private struct DelayedOutbound
         {
-            public DelayedOutbound(NetworkPeerState peer, byte[] data, byte channel, LiteNetLib.DeliveryMethod method, long dueUs, bool reliable)
+            public DelayedOutbound(NetworkPeerState peer, byte[] data, int length, byte channel, LiteNetLib.DeliveryMethod method, long dueUs, bool reliable)
             {
                 Peer = peer;
                 Data = data;
+                Length = length;
                 Channel = channel;
                 Method = method;
                 DueUs = dueUs;
@@ -177,6 +203,8 @@ namespace Krut.Netcode
             public NetworkPeerState Peer { get; }
 
             public byte[] Data { get; }
+
+            public int Length { get; }
 
             public byte Channel { get; }
 

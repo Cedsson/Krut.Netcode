@@ -65,7 +65,7 @@ namespace Krut.Netcode
             // Delivered only when NetworkConfig.UnconnectedMessages is on (LiteNetLib
             // drops them otherwise). Broadcasts are not used by the library.
             if (messageType == UnconnectedMessageType.BasicMessage)
-                _session.RaiseUnconnected(remoteEndPoint, reader.GetRemainingBytes());
+                _session.EnqueueUnconnected(remoteEndPoint, reader);
         }
 
         /// <inheritdoc/>
@@ -120,12 +120,15 @@ namespace Krut.Netcode
         public static NetworkEvent Received(NetPeer peer, byte[] data, int length, NetworkDelivery delivery)
             => new() { Kind = NetworkEventKind.Received, Peer = peer, Data = data, Length = length, Delivery = delivery };
 
+        public static NetworkEvent Unconnected(IPEndPoint endPoint, byte[] data, int length)
+            => new() { Kind = NetworkEventKind.Unconnected, EndPoint = endPoint, Data = data, Length = length };
+
         public static NetworkEvent Socket(IPEndPoint endPoint, SocketError error)
             => new() { Kind = NetworkEventKind.SocketError, EndPoint = endPoint, Error = error };
     }
 
     /// <summary>
-    /// Which of the four queued events this is. The values are internal and the order is not on the wire - a
+    /// Which of the queued events this is. The values are internal and the order is not on the wire - a
     /// mismatch with <see cref="NetworkEvent.Kind"/> is a bug the drain switch in <see cref="NetworkSession"/>
     /// would simply not handle, which is why every case there is explicit rather than having a default.
     /// </summary>
@@ -134,6 +137,7 @@ namespace Krut.Netcode
         PeerConnected,
         PeerDisconnected,
         Received,
+        Unconnected,
         SocketError,
     }
 }
