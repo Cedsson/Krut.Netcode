@@ -32,9 +32,11 @@ file names are given so the claim can be re-checked. Out-of-scope items are out 
 
 - Snapshot format, delta encoding and interest management. The library carries bytes and gives
   you tick-stamped state primitives; it does not know what an entity is.
-- Encryption and authentication. The transport is plain UDP over LiteNetLib; an application that
-  needs confidentiality or account auth has to add it above or below.
-- Anti-cheat, matchmaking, lobby UI, NAT traversal and relay.
+- Key provisioning / account authentication, matchmaking UI, anti-cheat, and UDP relay fallback.
+  Transport/session encryption (`NetworkEncryptionConfig`) and NAT hole punching
+  (`NetworkNatRendezvousServer`, `NetworkServer.StartWithNat`, `NetworkClient.ConnectViaNat`) are
+  built in; matchmaking account auth, out-of-band key distribution, and TURN/UDP relay fallback for
+  Symmetric NAT remain the application's responsibility.
 - Physics determinism. The reconciler is only as good as the simulation it replays.
 
 ## Next steps

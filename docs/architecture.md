@@ -69,6 +69,25 @@ navigation only). Dependencies: LiteNetLib 2.1.5 and `System.Numerics`.
 | `NetworkStatistics.cs` | Byte and packet counters for the session. |
 | `NetDatagramProbe.cs` | Packet layer that only measures datagram sizes and totals. |
 
+**`Security/`: transport and session encryption**
+
+| File | Role |
+|---|---|
+| `NetworkEncryptionConfig.cs` | `NetworkCrypto` key helpers and `NetworkEncryptionConfig` (PSK, ephemeral ECDH, or combined). |
+| `NetworkEncryptionLayer.cs` | `PacketLayerBase` performing in-place `AES-256-GCM` datagram encryption with directional HKDF subkeys and anti-replay. |
+| `PeerSessionCrypto.cs` | Per-peer `ECDH P-256` key agreement, optional `ECDsa` transcript signing, and `EncryptedEnvelope` wrapping. |
+| `AntiReplayWindow.cs` | 64-packet sliding bitmask anti-replay filter. |
+| `NetworkEncryptionStats.cs` | Thread-safe encryption, authentication, replay, and key-exchange counters. |
+
+**`Nat/`: NAT punchthrough and rendezvous**
+
+| File | Role |
+|---|---|
+| `NatPunchProtocol.cs` | Zero-reflection `"KNAT"` v1 wire codec, endpoint normalization, and local endpoint lookup. |
+| `NatPunchConfig.cs` | Configuration, result structs, status codes, and `Interlocked` NAT/rendezvous counters. |
+| `NatRendezvousPacketLayer.cs` | Selective `PacketLayerBase` encrypting rendezvous datagrams when Match PSK is not set. |
+| `NetworkNatRendezvousServer.cs` | Standalone bounded/rate-limited UDP rendezvous server with room leases and optional PSK encryption. |
+
 ## 2. One frame, step by step
 
 Diagram: [Frame](diagrams.md#frame).
@@ -77,14 +96,24 @@ Diagram: [Frame](diagrams.md#frame).
 
 1. Release outgoing messages whose simulated delay has expired (`NetworkDelayQueue.FlushDue`), then
    `Flush()`.
-2. `NetManager.PollEvents()`: LiteNetLib calls `NetworkListener`, which appends to the pending
-   event list.
-3. `DrainEvents()`: swap the pending and draining lists, then handle each event in arrival order:
+2. `NetManager.PollEvents()`: LiteNetLib calls `NetworkListener`, which copies packet bytes into
+   pooled buffers and appends to the pending queue up to `MaxReceivedPacketBytes`,
+   `MaxEventsPerPeerPerPoll`, `MaxUnconnectedEventsPerPoll`, `MaxPendingEvents`, and
+   `MaxPendingEventBytes` (evicting older unreliable/unconnected payloads before dropping reliable
+   packets, while never dropping `PeerConnected`/`PeerDisconnected`).
+3. `DrainEvents()`: swap the pending and draining lists, then handle each event in arrival order
+   (optionally capped per frame by `MaxEventsPerDrain` with remaining events preserved in FIFO order):
    peer connected (`PeerConnected`), peer disconnected (`PeerDisconnected`), socket error
-   (`Error`), received packet (decode and `MessageReceived`, section 5).
-4. `NetworkClock.Advance(dt, OnTick)`: `OnTick` runs once per whole elapsed tick, at most
+   (`Error`), received packet (decode and `MessageReceived`, section 5), or unconnected datagram
+   (dispatching internal `"KNAT"` frames via `HandleInternalNatPacket` before copying user
+   unconnected buffers). Each callback is isolated in `try/catch` (`CallbackExceptionCount`,
+   `NetworkErrorCode.CallbackException`) and `try/finally` always clears `_draining` and returns
+   pooled buffers.
+4. `OnSessionUpdate(dt)` advances NAT host heartbeats, probe timers, and client punch deadlines when
+   NAT punchthrough is active.
+5. `NetworkClock.Advance(dt, OnTick)`: `OnTick` runs once per whole elapsed tick, at most
    `MaxCatchUpTicks` per frame. This is where a server sends its per-tick snapshot.
-5. `Flush()`: if anything was sent, `TriggerUpdate` wakes LiteNetLib's logic thread so packets
+6. `Flush()`: if anything was sent, `TriggerUpdate` wakes LiteNetLib's logic thread so packets
    leave now instead of on its next timer.
 
 `NetworkClient.Update` additionally runs the reconnect timer after the base update. Handlers may
@@ -117,7 +146,8 @@ byte 1..n     the message body, exactly what INetworkMessage.Write put out
 | 0 | Reserved (`None`); a corrupt header never looks like a valid message |
 | 1 | `Welcome` (peer id, tick rate, server tick, player name) |
 | 2, 3, 4 | `SystemChat`, `Chat`, `PlayerInfo` |
-| 5-15 | Reserved for future built-in messages |
+| 5, 6, 7 | `KeyExchangeHello`, `KeyExchangeReply`, `EncryptedEnvelope` (per-peer `ECDH` / `AES-256-GCM`) |
+| 8-15 | Reserved for future built-in messages |
 | 16-255 | Game messages, registered with `NetworkMessages.RegisterGameMessage<T>` |
 
 The channel and delivery method come from the message's `Delivery` and `Channel`:
@@ -153,14 +183,16 @@ Send:
 
 Receive:
 
-1. `PollEvents`: `NetworkListener.OnNetworkReceive` copies the bytes to a pooled buffer and
-   queues the event.
+1. `PollEvents`: `NetworkListener.OnNetworkReceive` checks packet size, per-peer burst, and global queue
+   bounds, copies the bytes to a pooled buffer, and queues the event.
 2. `Update`, step 3: `DecodeAndDeliver` reads the type byte, creates an instance from the registry
    (`NetworkMessages.CreateFromWire`, a pool rent) and calls `Read`.
-3. An empty packet or a `Read` that throws is `MalformedMessage` (counted, instance recycled). An
-   unregistered byte is `UnknownMessageType` (counted, connection kept).
-4. `MessageReceived` is invoked with a `NetworkEnvelope`; when it returns, the instance goes back to
-   the pool and the buffer returns to `ArrayPool`. Handlers copy what they keep.
+3. An empty packet, client-spoofed server message, trailing unread bytes, or a `Read` that throws is
+   `MalformedMessage` (counted, instance recycled). An unregistered byte is `UnknownMessageType`
+   (counted, connection kept).
+4. `MessageReceived` is invoked with a `NetworkEnvelope` inside an exception-isolated block; when it
+   returns (or throws), the instance goes back to the pool and the buffer returns to the packet pool.
+   Handlers copy what they keep.
 
 ## 6. Handshake and reconnect
 
@@ -170,16 +202,22 @@ Diagram: [Handshake](diagrams.md#handshake).
 client                                   server
   Connect(addr, port, name)
   connection request + payload  ------>  HandleConnectionRequest
-                                           ApplicationId differs -> silent reject
-                                           ProtocolVersion differs -> reject + reason
+  (wrapped in NetworkEncryptionLayer       ApplicationId differs -> silent reject
+   when PSK is configured)                 ProtocolVersion differs -> reject + reason
                                            ConnectionApproval refuses -> reject + reason
                                            lobby full -> reject + reason
                                          accept
+  [if EnableSessionKeyExchange] <------  KeyExchangeHello (ECDH P-256 pub, nonce, optional ECDsa sig)
+  KeyExchangeReply (pub, nonce, HMAC) -> verify MAC, derive per-peer AES-256-GCM keys
                                 <------  OnPeerConnected: Welcome (reliable), then PlayerInfo rows
   Welcome: set peer id, name,
   ResetClockTo(ServerTick),
   state = Connected, SessionReady
 ```
+
+`NetworkDatagramChain` composes `[NetworkEncryptionLayer (or NatRendezvousPacketLayer), NetworkDatagramSimLayer, NetDatagramProbe]` in order from game to socket when enabled. When `EnableSessionKeyExchange` is on, plaintext session frames outside `KeyExchangeHello`/`KeyExchangeReply`/`EncryptedEnvelope` are rejected as `SecurityError`, and every `Send`/`Broadcast` encrypts per peer into `EncryptedEnvelope`.
+
+**NAT punchthrough handoff:** `NetworkServer.RegisterNatRoom` and `NetworkClient.ConnectViaNat` exchange `"KNAT"` v1 unconnected datagrams on the session's active UDP socket so NAT port mappings are reused unchanged. Once a client punches through in `NetworkClientState.Punching`, it transitions directly to `Connecting` and calls `ConnectTo(punchedEndPoint, handshake)` on that same bound socket (while `AutoReconnect` re-punches via `ConnectViaNat` if the session drops later). When a match PSK `NetworkEncryptionLayer` is installed alongside NAT, a per-endpoint rendezvous route delegates rendezvous packets to `RendezvousPreSharedKey` (or allows plaintext `"KNAT"` unconnected packets only while blocking non-`"KNAT"` and `ConnectionRequest` traffic from the rendezvous endpoint); when no match PSK is set, `NatRendezvousPacketLayer` selectively encrypts only rendezvous traffic.
 
 `PeerConnected` fires when the transport is up, before `Welcome`; replicate after `SessionReady`.
 A rejection arrives as a disconnect whose additional data is the server's text, surfaced through
@@ -235,8 +273,11 @@ These are the rules that make the library correct. Do not break them; tests and 
    be sent back to the network or fed into authoritative logic.
 7. **The library never throws or logs at the game for network problems.** Everything is an
    `Error` event with a `NetworkErrorCode`; bad input from a peer (unknown type, short packet,
-   oversized name) is counted and dropped. Programmer errors, such as sending an unregistered
-   game message, do throw, and `Validate()` clamps configuration instead of refusing it.
+   trailing bytes, oversized packet/name) is counted and dropped. Application callback exceptions
+   during `DrainEvents` are isolated, counted (`CallbackExceptionCount`), and reported via
+   `NetworkErrorCode.CallbackException` without corrupting queue state or leaking pooled buffers.
+   Programmer errors, such as sending an unregistered game message, do throw, and `Validate()`
+   clamps configuration instead of refusing it.
 8. **Single-threaded game side.** No game callback runs on a LiteNetLib thread; do not add locks
    or background work that touches session state.
 9. **Simulation affects only what a session sends**, and never LiteNetLib's own pings and acks

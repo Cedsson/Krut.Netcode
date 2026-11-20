@@ -34,6 +34,18 @@
 | **Snapshot Interpolation** | `NetworkSnapshotInterpolator<TState>` for remote entities with sub-tick rendering, bounded dead-reckoning extrapolation, and SIMD-accelerated component blending (`NetworkStateBlend`). |
 | **Deterministic Link Simulator** | Built-in `NetworkSimulation` (latency, jitter, Gilbert–Elliott burst loss, packet reorder, duplication, token-bucket bandwidth cap, and scheduled blackouts) at message or raw datagram level. |
 | **Hardened Wire Codec** | 16-bit quantized 3D positions and unit quaternions, non-finite (`NaN`/`Infinity`) sanitization, UTF-16 surrogate-safe truncation, control/Bidi-override stripping, and strict packet-length validation. |
+| **Authenticated Transport Encryption** | Opt-in two-tier `AES-256-GCM` encryption: 0-RTT pre-shared key / match-token datagram encryption (including handshake) and/or per-peer ephemeral `ECDH P-256` session keys with optional `ECDsa` server identity pinning and 64-packet anti-replay windows. |
+| **NAT Punchthrough & Rendezvous** | Built-in NativeAOT-safe binary `"KNAT"` v1 hole punching (`NetworkServer.StartWithNat`, `NetworkClient.ConnectViaNat`) and a standalone bounded/rate-limited `NetworkNatRendezvousServer` (`samples/NatRendezvousServer`) with 128-bit nonces/`HostSecret`, optional Rendezvous `AES-256-GCM` PSK, and full Match PSK / ECDH compatibility. |
+
+### Scope & Non-Goals
+
+**Krut.Netcode** is a focused core networking foundation — not a full entity-replication framework or game engine runtime. While opt-in transport encryption (`NetworkEncryptionConfig`) and server identity pinning protect confidentiality, integrity, and replay resistance on the wire, the library intentionally leaves the following to your game or server layer:
+
+- **Entity lifecycle & network IDs** (spawning, despawning, object ownership mapping)
+- **Snapshot serialization & delta compression** (what fields exist per entity, baseline/delta encoding)
+- **Interest management & prioritization** (spatial/team visibility, relevancy filtering, send budgets)
+- **Key distribution, account auth & relay fallback** (matchmaking token distribution, player account authentication, and UDP/TURN relay fallback when Symmetric NAT blocks direct hole punching)
+- **Authoritative gameplay validation & anti-cheat** (verifying entity ownership, input rates, tick windows, movement/acceleration/speed bounds, cooldowns, and valid action states server-side)
 
 ---
 
@@ -123,8 +135,9 @@ public sealed class CarInputMessage : INetworkMessage
     public void Read(NetDataReader reader)
     {
         Tick = reader.GetInt();
-        Throttle = reader.GetFloat();
-        Steer = reader.GetFloat();
+        // Clamp untrusted floats on decode; server logic must still verify tick windows, rate, and physics limits.
+        Throttle = NetworkCodec.ReadClampedFloat(reader, -1f, 1f);
+        Steer = NetworkCodec.ReadClampedFloat(reader, -1f, 1f);
     }
 }
 
@@ -307,11 +320,14 @@ Krut.Netcode/
 │   ├── Messages/                      # INetworkMessage, NetworkMessages, NetworkCodec, NetworkProtocol
 │   ├── Time/                          # NetworkClock, NetworkTimeSync
 │   ├── Prediction/                    # NetworkReconciler, NetworkSnapshotInterpolator, NetworkStateRing
+│   ├── Security/                      # NetworkEncryptionConfig, NetworkEncryptionLayer, PeerSessionCrypto
+│   ├── Nat/                           # NatPunchProtocol, NatPunchConfig, NetworkNatRendezvousServer
 │   ├── Simulation/                    # NetworkSimulation, NetworkLinkModel, NetworkDelayQueue, Datagram layers
 │   └── Diagnostics/                   # NetworkStatistics, NetDatagramProbe
-├── tests/Krut.Netcode.Tests/          # xUnit test suite (handshake, codec, zero-alloc, security, simulator)
+├── tests/Krut.Netcode.Tests/          # xUnit test suite (handshake, codec, zero-alloc, security, NAT, simulator)
 ├── benchmarks/Krut.Netcode.Benchmarks/# BenchmarkDotNet throughput & memory benchmarks
 ├── samples/PredictionDemo/            # Headless server + 2 clients verification harness
+├── samples/NatRendezvousServer/       # Deployable CLI NAT rendezvous server (--port, --psk, --generate-key)
 └── docs/                              # In-depth user guide, maintainer architecture & Mermaid diagrams
 ```
 

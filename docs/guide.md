@@ -23,22 +23,28 @@ overrides the `protected virtual OnTick()` to run once per whole tick.
 ## 2. Core types
 
 - **`NetworkSession`** (abstract): peers, tick clock, dispatch, `Send`/`Broadcast`, static
-  `Rent<T>()`, `ApplySimulation`, `ResetClockTo(serverTick)`, counters
-  (`UnknownMessageCount`, `MalformedMessageCount`, `DroppedPacketCount`). Events:
+  `Rent<T>()`, `ApplySimulation`, `ResetClockTo(serverTick)`, counters & telemetry
+  (`UnknownMessageCount`, `MalformedMessageCount`, `DroppedPacketCount`, `PendingEventCount`,
+  `PeakPendingEventCount`, `PendingEventBytes`, `PeakPendingEventBytes`,
+  `DroppedInboundEventCount`, `DroppedInboundBytes`, `CallbackExceptionCount`,
+  `LastDrainedEventCount`, `LastReleasedTickCount`, `LastClampedTickCount`,
+  `TotalClampedTicks`, `CatchUpClampCount`, `LastUpdateDurationMs`, `LastTickDurationMs`). Events:
   `PeerConnected`, `PeerDisconnected`, `MessageReceived`, `Error`.
-- **`NetworkServer`**: `Start()` (false if the port cannot be bound), `Stop()`,
+- **`NetworkServer`**: `Start()` (false if the port cannot be bound), `StartWithNat(...)`, `RegisterNatRoom(...)`, `UnregisterNatRoom()`, `Stop()`,
   `ConnectionApproval` (set before `Start`), `DisconnectPeer`, `DisconnectAll`. Always enforces `MaxClients` (after `ConnectionApproval` if one is set).
-- **`NetworkClient`**: `Connect(address, port, name)`, `Disconnect`, `Stop`, `SetPlayerName`,
-  `State` (`Offline`/`Connecting`/`Connected`/`Reconnecting`), `IsSessionReady`, events
-  `SessionReady`, `Closed`. The connection is up long before `Welcome` arrives: replicate only
+- **`NetworkClient`**: `Connect(address, port, name)`, `ConnectViaNat(rendezvousHost, port, roomCode, name)`, `Disconnect`, `Stop`, `SetPlayerName`,
+  `State` (`Offline`/`Connecting`/`Connected`/`Reconnecting`/`Punching`), `IsSessionReady`, events
+  `SessionReady`, `Closed`, `NatPunchSucceeded`, `NatPunchFailed`. The connection is up long before `Welcome` arrives: replicate only
   after `SessionReady`, not `PeerConnected`.
 - **`NetworkPeerState`**: id, sanitized name, `Ping`, `Rtt`, packet counters,
-  `PacketLossPercent`, `ReliableQueueLength` (growing = overload), `Tag` for game data.
+  `PacketLossPercent`, `ReliableQueueLength` (growing = overload), `DroppedInboundEvents`, `Tag` for game data.
 - **`NetworkEnvelope`**: a received message (`PeerId`, `Message`, `Delivery`). `NetworkError`
   carries a `NetworkErrorCode` (`Socket`, `ConnectionRejected`, `MalformedMessage`,
-  `UnknownMessageType`, `PacketTooLarge`, `PeerUnknown`, `NotConnected`, `StartFailed`). The
+  `UnknownMessageType`, `PacketTooLarge`, `PeerUnknown`, `NotConnected`, `StartFailed`,
+  `CallbackException`, `InboundOverload`, `SecurityError`, `NatPunchFailed`). The
   library never throws at game logic for network problems and never logs; everything comes via
-  `Error`.
+  `Error`. Callback exceptions thrown during `Update` event draining are isolated per event,
+  reported as `CallbackException`, and never leave pooled buffers unreturned or replayed.
 
 Handshake: the client sends `ApplicationId`, `ProtocolVersion` and a name. The server validates all
 three plus `MaxClients` and the approval callback, then accepts or rejects with a readable reason.
@@ -66,15 +72,70 @@ file cannot stop the layer from starting.
 | `ReconnectDelayMs` / `MaxConnectAttempts` / `AutoReconnect` | `500` / `8` / `false` | Client reconnect: retry delay / retries before giving up (client goes `Offline`, error `NotConnected`) / on-off |
 | `IPv6Support` | `true` | Dual-stack |
 | `MaxCatchUpTicks` | `5` | Cap on ticks released in one frame |
+| `MaxPendingEvents` | `4096` | Max queued inbound payload/socket events before overload policy runs |
+| `MaxPendingEventBytes` | `4 MiB` | Max total payload bytes queued across inbound packets |
+| `MaxReceivedPacketBytes` | `64 KiB` | Max byte length of a single connected inbound packet |
+| `MaxEventsPerPeerPerPoll` | `256` | Per-peer packet burst limit per poll cycle |
+| `MaxUnconnectedEventsPerPoll` | `64` | Unconnected datagram burst limit per poll cycle |
+| `MaxEventsPerDrain` | `0` | Max events dispatched per `Update` (`0` = drain all) |
+| `Encryption` | `null` | Optional `NetworkEncryptionConfig` (PSK datagram AES-256-GCM and/or per-peer ECDH P-256) |
+| `NatPunch` | `null` | Optional `NatPunchConfig` (rendezvous PSK encryption, probe/heartbeat cadence, timeout, `LocalEndPointOverride`) |
+
+### Transport Encryption (`NetworkEncryptionConfig`)
+
+By default (`Encryption == null`), UDP datagrams travel in plaintext. Set `NetworkConfig.Encryption` to encrypt traffic with hardware-accelerated, Native-AOT-safe `AES-256-GCM`:
+
+- **Pre-shared key / match token (`NetworkEncryptionConfig.CreatePreSharedKey(key, previousKey, keyId)`):** installs `NetworkEncryptionLayer` at the start of `NetworkDatagramChain`, encrypting and authenticating **100% of UDP datagrams** (including the connection handshake, pings, acks, and messages) with zero extra round trips, directional HKDF-SHA256 subkeys (preventing reflection attacks), a 64-packet sliding anti-replay window, and optional zero-downtime key rotation via `PreviousPreSharedKey`.
+- **Per-peer ephemeral ECDH P-256 (`NetworkEncryptionConfig.CreateEphemeral(serverPrivateKey, serverPublicKey)`):** derives unique forward-secret per-client `AES-256-GCM` keys with key confirmation (`HMAC-SHA256`) and rejects plaintext downgrade attempts (`NetworkErrorCode.SecurityError`). Passing an `ECDsa` P-256 identity key pair (`NetworkCrypto.GenerateIdentityKeyPair()`) pins the server identity on clients to block active MITM.
+- **Combined (`NetworkEncryptionConfig.CreateCombined(...)`):** wraps the handshake and datagrams in PSK `AES-256-GCM` while upgrading each peer to isolated forward-secret session keys.
+- **Threat-model note:** PSK protects against passive network eavesdropping, tampering, and off-path spoofing, but a key embedded in a public client binary does not hide traffic from someone who extracts the binary key — distribute per-match tokens from your backend or combine with pinned `ECDsa` server identity + ephemeral ECDH (`CreateEphemeral` / `CreateCombined`). Monitor `session.EncryptionStats` and `NetworkPeerState.IsSessionEncrypted`.
+
+### NAT Punchthrough (`NetworkNatRendezvousServer`)
+
+Krut.Netcode includes a NativeAOT-safe binary NAT hole-punching protocol (`"KNAT"` v1) and a standalone rendezvous server (`NetworkNatRendezvousServer`, plus a runnable CLI under `samples/NatRendezvousServer`) so players can host and join rooms behind Cone NATs without manual port forwarding:
+
+```csharp
+// 1. Public VPS / backend (or tests): run NetworkNatRendezvousServer
+byte[] rdvKey = NetworkCrypto.GenerateKey(); // Optional AES-256-GCM authentication
+using var rendezvous = new NetworkNatRendezvousServer(new NatRendezvousConfig
+{
+    Port = 26000,
+    PreSharedKey = rdvKey,
+});
+rendezvous.Start();
+
+// 2. Host behind home router NAT
+hostConfig.NatPunch = NatPunchConfig.CreateEncrypted(rdvKey);
+using var host = new NetworkServer(hostConfig);
+host.StartWithNat("rdv.example.com", 26000, "ROOM-42");
+
+// 3. Client behind its own router NAT
+clientConfig.NatPunch = NatPunchConfig.CreateEncrypted(rdvKey);
+using var client = new NetworkClient(clientConfig);
+client.ConnectViaNat("rdv.example.com", 26000, "ROOM-42", "Alice");
+```
+
+- **Security:** Each host generates a 128-bit random `HostSecret` (preventing room hijacking/spoofed unregistration), each client join uses a 128-bit `RequestNonce`, and each introduction generates a fresh 128-bit `PunchNonce`. `NetworkNatRendezvousServer` bounds active rooms (`MaxRooms`), sweeps expired leases (`RoomLeaseSeconds`), and enforces per-IP and per-room rate limits.
+- **Encryption combinations:** Works seamlessly with plaintext, Match PSK (`NetworkEncryptionConfig.CreatePreSharedKey`), ephemeral ECDH + `ECDsa` pinning (`CreateEphemeral`), `CreateCombined`, and optional separate `NatPunchConfig.CreateEncrypted(rdvKey)` so rendezvous coordination and match traffic remain cryptographically isolated.
+- **Same-socket handoff & Symmetric NAT:** Both `NetworkServer` and `NetworkClient` punch directly on their active game UDP socket (`ConnectViaNat` calls `ConnectTo` on the same bound socket once punched so the NAT pinhole mapping stays valid). Symmetric NAT / strict carrier-grade NAT (mobile CGNAT) randomizes outbound source ports per destination and cannot be traversed by direct hole punching alone — fall back to a UDP relay if needed.
 
 ### `NetworkCodec`
 
-`WritePosition`/`ReadPosition` (three shorts over a world extent, ~2 cm; default extent 32000),
+`WritePosition`/`ReadPosition` (three shorts over a world extent; default extent `32000f` gives `±0.488` units/axis — tuned for centimeter-scale units, so for meter-scale worlds pass a smaller custom `extent` such as `500f` or `2000f` consistently on both sides, or use `WriteVector`/`ReadVector`),
 `WriteRotation`/`ReadRotation` (four shorts, normalized on read), `WriteVector`/`ReadVector` (three
-floats, rare events), `WriteName`/`SanitizeName` (max 32 chars, control characters stripped),
+floats, non-finite sanitized to `0`), `ReadFiniteFloat`/`ReadClampedFloat` (safe float input decoding), `WriteName`/`SanitizeName` (max 32 chars, control/format characters stripped),
 `WriteText` (max 512). Names and text are sanitized on the way in so a bad client cannot inject
 control characters or blow up packet size. The codec uses `System.Numerics` `Vector3`/`Quaternion`;
 the library has no dependency on any game engine.
+
+### Protocol vs. Gameplay Validation
+
+Wire-level decoding checks type bytes, message lengths, trailing unread bytes, server-only built-in message spoofing (`Welcome`/`SystemChat`/`PlayerInfo`), and non-finite/oversized codec primitives. **A valid packet is still untrusted gameplay data.** Your server must enforce:
+
+- **Ownership & permissions:** verify `envelope.PeerId` owns or may act on the target entity/action.
+- **Tick window & input rate:** reject or clamp out-of-window input ticks and excessive action rates.
+- **Physics & movement bounds:** clamp inputs with `NetworkCodec.ReadClampedFloat` and validate velocities, accelerations, positions, and step deltas server-side.
+- **State legality & cooldowns:** verify ability cooldowns, alive/match states, and state transitions before mutating authoritative state.
 
 ## 3. Messages
 
@@ -171,10 +232,12 @@ entities through `NetworkSnapshotInterpolator` (drawn in the past). They are dif
   game defines its own.
 - **`NetworkStateRing<TEntry>`**. Fixed-size ring of tick-stamped entries, strictly increasing
   ticks (late/duplicate `Push` returns false). Bounded memory; substrate for the two below.
-- **`NetworkStateBlend`**. Reflection-free blending of `unmanaged` states, assuming 4-byte
-  components (`float`/`int`/`uint`; not `bool`/enum: set the interpolator's `Lerp` /
-  `Extrapolate` delegates instead). Never blend rotations component-wise (the midpoint of unit
-  quaternions is not unit; `q` and `-q` are the same rotation): use `SlerpRotation`.
+- **`NetworkStateBlend`**. Reflection-free component-wise blending of `unmanaged` states, assuming
+  every 4-byte field is a 32-bit `float` (`float`, `Vector2`/`3`/`4`). Do **not** include `int`,
+  `uint`, `bool`, enums, flags, or IDs in structs blended component-wise — reinterpreting integer bits as
+  floats corrupts values (use a separate struct for discrete state or install typed `Lerp` /
+  `Extrapolate` / `RenderOffset` / `DistanceMetric` delegates). Never blend rotations component-wise
+  (the midpoint of unit quaternions is not unit; `q` and `-q` are the same rotation): use `SlerpRotation`.
 - **`NetworkSnapshotInterpolator<TState>`** (remote entities). Draws `DelayTicks` (2-3) in the
   past because interpolation needs two samples and a single lost packet must not be visible.
   `Push(tick, state)` on each received snapshot, `TrySampleTime(renderTick, ...)` per frame with
