@@ -34,6 +34,9 @@ namespace Krut.Netcode
 
         /// <summary>An inbound event queue, byte budget, packet-size, or per-peer burst limit was exceeded and traffic was dropped.</summary>
         InboundOverload,
+
+        /// <summary>An encryption handshake, authentication, or replay check failed.</summary>
+        SecurityError,
     }
 
     /// <summary>A network error to show/log - the library never throws exceptions at the game logic for network problems.</summary>

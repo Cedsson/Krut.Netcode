@@ -1,5 +1,6 @@
 using System;
 using System.Net;
+using System.Security.Cryptography;
 using LiteNetLib;
 using LiteNetLib.Utils;
 
@@ -90,6 +91,9 @@ namespace Krut.Netcode
         /// </summary>
         public int ReliableQueueLength => Peer.GetPacketsCountInReliableQueue(false);
 
+        /// <summary>True once per-peer ephemeral ECDH session encryption has completed for this peer.</summary>
+        public bool IsSessionEncrypted => SessionCrypto is not null;
+
         /// <summary>Number of inbound packets from this peer dropped or evicted due to overload limits.</summary>
         public long DroppedInboundEvents { get; internal set; }
 
@@ -97,6 +101,28 @@ namespace Krut.Netcode
         internal int InboundEventsInPoll { get; set; }
         internal int InboundUnreliableInPoll { get; set; }
         internal int InboundEvictCursor { get; set; }
+
+        internal PeerSessionCrypto? SessionCrypto { get; set; }
+        internal ECDiffieHellman? PendingEcdh { get; set; }
+        internal byte[]? PendingServerPubKey { get; set; }
+        internal byte[]? PendingServerNonce { get; set; }
+        internal long HandshakeStartTimestamp { get; set; }
+
+        internal void DisposeCrypto()
+        {
+            SessionCrypto?.Dispose();
+            SessionCrypto = null;
+            PendingEcdh?.Dispose();
+            PendingEcdh = null;
+            PendingServerPubKey = null;
+            if (PendingServerNonce is not null)
+            {
+                CryptographicOperations.ZeroMemory(PendingServerNonce);
+                PendingServerNonce = null;
+            }
+
+            HandshakeStartTimestamp = 0;
+        }
 
         /// <summary>The underlying LiteNetLib peer. Internal: game logic goes through this wrapper.</summary>
         internal NetPeer Peer { get; }

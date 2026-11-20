@@ -101,6 +101,15 @@ namespace Krut.Netcode
 
         /// <summary>Server -&gt; everyone. Peer id, name and when the connection came up - so a lobby can show who is in it.</summary>
         PlayerInfo = 4,
+
+        /// <summary>Internal security handshake: server ephemeral ECDH public key, nonce, and optional identity signature.</summary>
+        KeyExchangeHello = 5,
+
+        /// <summary>Internal security handshake: client ephemeral ECDH public key, nonce, and key-confirmation MAC.</summary>
+        KeyExchangeReply = 6,
+
+        /// <summary>Internal authenticated-encryption wrapper carrying a nested protocol or game message.</summary>
+        EncryptedEnvelope = 7,
     }
 
     /// <summary>

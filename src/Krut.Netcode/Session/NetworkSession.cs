@@ -3,6 +3,7 @@ using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using LiteNetLib;
 using LiteNetLib.Utils;
 
@@ -40,8 +41,17 @@ namespace Krut.Netcode
         /// <summary>Reused for sending - no allocations per packet (see <see cref="SendInternal"/>). The parameter is the initial size.</summary>
         private readonly NetDataWriter _writer = new(true, 256);
 
+        /// <summary>Reused for per-peer encrypted envelopes - no allocations per packet.</summary>
+        private readonly NetDataWriter _cryptoWriter = new(true, 256);
+
         private bool _writerInUse;
+        private bool _cryptoWriterInUse;
         private bool _inUpdate;
+
+        private readonly bool _useSessionKeyExchange;
+        private readonly NetworkEncryptionLayer? _encryptionLayer;
+        private readonly ECDsa? _serverIdentitySigner;
+        private readonly ECDsa? _serverIdentityVerifier;
 
         /// <summary>
         /// Keyed by peer id, not by peer object: a message handler routinely wants to find a peer from an id in
@@ -85,13 +95,46 @@ namespace Krut.Netcode
         {
             Config = (config ?? new NetworkConfig()).Clone();
             Config.Validate();
+            Config.Encryption?.Validate(isServer);
             IsServer = isServer;
             _clock = new NetworkClock(Config.TickRate, Config.MaxCatchUpTicks);
             _listener = new NetworkListener(this);
             _onTick = OnTick;
             _reportSafely = ReportSafely;
 
-            DatagramChain = Config.DatagramLayer ?? NetworkDatagramChain.DefaultFactory?.Invoke();
+            var chain = Config.DatagramLayer ?? NetworkDatagramChain.DefaultFactory?.Invoke();
+            if (Config.Encryption?.PreSharedKey is { } preSharedKey)
+            {
+                _encryptionLayer = new NetworkEncryptionLayer(
+                    preSharedKey,
+                    isServer,
+                    Config.Encryption.PreviousPreSharedKey,
+                    Config.Encryption.KeyId,
+                    Config.Encryption.EnableAntiReplay,
+                    EncryptionStats);
+
+                if (chain is null)
+                    chain = new NetworkDatagramChain(_encryptionLayer);
+                else if (!chain.HasEncryptionLayer)
+                    chain = chain.WithPrependedLayer(_encryptionLayer);
+            }
+
+            if (Config.Encryption?.EnableSessionKeyExchange == true)
+            {
+                _useSessionKeyExchange = true;
+                if (isServer && Config.Encryption.ServerIdentityPrivateKey is { } privKey)
+                {
+                    _serverIdentitySigner = ECDsa.Create();
+                    _serverIdentitySigner.ImportPkcs8PrivateKey(privKey, out _);
+                }
+                else if (!isServer && Config.Encryption.ServerIdentityPublicKey is { } pubKey)
+                {
+                    _serverIdentityVerifier = ECDsa.Create();
+                    _serverIdentityVerifier.ImportSubjectPublicKeyInfo(pubKey, out _);
+                }
+            }
+
+            DatagramChain = chain;
             _manager = new NetManager(_listener, DatagramChain!);
             _manager.ChannelsCount = NetworkChannels.Count;
             _manager.IPv6Enabled = Config.IPv6Support;
@@ -238,6 +281,12 @@ namespace Krut.Netcode
 
         /// <summary>The simulation that is switched on right now, or null (see <see cref="ApplySimulation"/>).</summary>
         public NetworkSimulation? Simulation => _simulation;
+
+        /// <summary>Encryption, authentication, anti-replay, and key-exchange counters for this session.</summary>
+        public NetworkEncryptionStats EncryptionStats { get; } = new();
+
+        /// <summary>True if datagram-level PSK encryption or per-peer ECDH session encryption is enabled.</summary>
+        public bool IsEncrypted => (Config.Encryption?.IsEnabled == true) || (DatagramChain?.HasEncryptionLayer == true);
 
         /// <summary>Switches on a network simulation (see <see cref="NetworkSimulation"/>).</summary>
         public void ApplySimulation(NetworkSimulation simulation)
@@ -648,6 +697,9 @@ namespace Krut.Netcode
                 _manager.PollEvents();
                 DrainEvents();
 
+                if (_useSessionKeyExchange && !_disposed && IsRunning && _peers.Count > 0)
+                    CheckKeyExchangeTimeouts();
+
                 if (!_disposed && IsRunning)
                 {
                     long tickStart = Stopwatch.GetTimestamp();
@@ -761,6 +813,7 @@ namespace Krut.Netcode
 
             byte wireType = 0;
             NetDataWriter? writer = null;
+            NetDataWriter? cryptoWriter = null;
             try
             {
                 writer = AcquireWriter();
@@ -773,15 +826,42 @@ namespace Krut.Netcode
                 var deliveryMethod = NetworkChannels.ToDeliveryMethod(delivery);
                 bool simActive = _simulation is { IsActive: true };
 
-                for (int i = 0; i < n; i++)
+                if (_useSessionKeyExchange)
                 {
-                    var peer = targets[i];
-                    targets[i] = null!;
-                    SendWriterToPeer(peer, writer, delivery, deliveryMethod, channel, message.Type, simActive);
+                    cryptoWriter = AcquireCryptoWriter();
+                    ReadOnlySpan<byte> plaintext = writer.Data.AsSpan(0, writer.Length);
+                    for (int i = 0; i < n; i++)
+                    {
+                        var peer = targets[i];
+                        targets[i] = null!;
+                        var crypto = peer.SessionCrypto;
+                        if (crypto is null)
+                            continue;
+
+                        if (!crypto.TryEncryptEnvelope(plaintext, (byte)delivery, cryptoWriter))
+                        {
+                            ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, $"Session encryption failed for peer {peer.Id}.", peer.Id));
+                            continue;
+                        }
+
+                        EncryptionStats.IncrementEncrypted();
+                        SendWriterToPeer(peer, cryptoWriter, delivery, deliveryMethod, channel, message.Type, simActive);
+                    }
+                }
+                else
+                {
+                    for (int i = 0; i < n; i++)
+                    {
+                        var peer = targets[i];
+                        targets[i] = null!;
+                        SendWriterToPeer(peer, writer, delivery, deliveryMethod, channel, message.Type, simActive);
+                    }
                 }
             }
             finally
             {
+                if (cryptoWriter is not null)
+                    ReleaseCryptoWriter(cryptoWriter);
                 if (writer is not null)
                     ReleaseWriter(writer);
                 Array.Clear(targets, 0, n);
@@ -826,7 +906,10 @@ namespace Krut.Netcode
                 _manager.Stop();
             }
 
+            foreach (var peer in _peers.Values)
+                peer.DisposeCrypto();
             _peers.Clear();
+            _encryptionLayer?.ResetReplayState();
             ReleaseBuffers(_pending);
             _pending.Clear();
             _pendingPayloadEventCount = 0;
@@ -835,6 +918,7 @@ namespace Krut.Netcode
             _unconnectedEventsInPoll = 0;
             _unknownPeerEventsInPoll = 0;
             _writerInUse = false;
+            _cryptoWriterInUse = false;
 
             // Queued packets are released: they would otherwise hold references to peers and byte arrays that
             // no longer mean anything.
@@ -855,6 +939,9 @@ namespace Krut.Netcode
                 return;
 
             ShutdownSession();
+            _encryptionLayer?.Dispose();
+            _serverIdentitySigner?.Dispose();
+            _serverIdentityVerifier?.Dispose();
             _disposed = true;
             GC.SuppressFinalize(this);
         }
@@ -906,6 +993,8 @@ namespace Krut.Netcode
         protected void StopListener()
         {
             _manager.Stop();
+            foreach (var peer in _peers.Values)
+                peer.DisposeCrypto();
             _peers.Clear();
         }
 
@@ -951,7 +1040,11 @@ namespace Krut.Netcode
         internal NetworkPeerState? RemovePeer(int peerId)
         {
             _delayQueue.RemovePeer(peerId);
-            return _peers.Remove(peerId, out var peer) ? peer : null;
+            if (!_peers.Remove(peerId, out var peer))
+                return null;
+
+            peer.DisposeCrypto();
+            return peer;
         }
 
         /// <summary>Reports an error to the game (the library doesn't log network errors itself).</summary>
@@ -1058,12 +1151,31 @@ namespace Krut.Netcode
                 _writerInUse = false;
         }
 
+        private NetDataWriter AcquireCryptoWriter()
+        {
+            if (!_cryptoWriterInUse)
+            {
+                _cryptoWriterInUse = true;
+                _cryptoWriter.Reset();
+                return _cryptoWriter;
+            }
+
+            return new NetDataWriter(true, 256);
+        }
+
+        private void ReleaseCryptoWriter(NetDataWriter writer)
+        {
+            if (ReferenceEquals(writer, _cryptoWriter))
+                _cryptoWriterInUse = false;
+        }
+
         /// <summary>Writes and sends a message, and hands it back to the pool (it belongs to the session afterwards).</summary>
         private void SendInternal(NetworkPeerState peer, INetworkMessage message, bool recycle = true)
         {
             // The wire byte routes a game message back to its own pool; with 0 it would never be recycled.
             byte wireType = 0;
             NetDataWriter? writer = null;
+            NetDataWriter? cryptoWriter = null;
             try
             {
                 writer = AcquireWriter();
@@ -1075,10 +1187,41 @@ namespace Krut.Netcode
                 var delivery = message.Delivery;
                 var deliveryMethod = NetworkChannels.ToDeliveryMethod(delivery);
                 bool simActive = _simulation is { IsActive: true };
-                SendWriterToPeer(peer, writer, delivery, deliveryMethod, channel, message.Type, simActive);
+
+                if (_useSessionKeyExchange)
+                {
+                    var crypto = peer.SessionCrypto;
+                    if (crypto is null)
+                    {
+                        ReportSafely(new NetworkError(
+                            NetworkErrorCode.SecurityError,
+                            $"Cannot send {message.Type} before per-peer encryption handshake completed for peer {peer.Id}.",
+                            peer.Id));
+                        return;
+                    }
+
+                    cryptoWriter = AcquireCryptoWriter();
+                    if (!crypto.TryEncryptEnvelope(writer.Data.AsSpan(0, writer.Length), (byte)delivery, cryptoWriter))
+                    {
+                        ReportSafely(new NetworkError(
+                            NetworkErrorCode.SecurityError,
+                            $"Session encryption failed for peer {peer.Id}.",
+                            peer.Id));
+                        return;
+                    }
+
+                    EncryptionStats.IncrementEncrypted();
+                    SendWriterToPeer(peer, cryptoWriter, delivery, deliveryMethod, channel, message.Type, simActive);
+                }
+                else
+                {
+                    SendWriterToPeer(peer, writer, delivery, deliveryMethod, channel, message.Type, simActive);
+                }
             }
             finally
             {
+                if (cryptoWriter is not null)
+                    ReleaseCryptoWriter(cryptoWriter);
                 if (writer is not null)
                     ReleaseWriter(writer);
                 if (recycle)
@@ -1219,6 +1362,17 @@ namespace Krut.Netcode
                     // If the peer is already in the list (the server put it there during the handshake) it
                     // is reused, so that the peer object and the name stay together.
                     var peer = _peers.TryGetValue(networkEvent.Peer!.Id, out var existing) ? existing : AddPeer(networkEvent.Peer!);
+                    if (_useSessionKeyExchange)
+                    {
+                        if (IsServer)
+                        {
+                            BeginServerKeyExchange(peer);
+                            break;
+                        }
+
+                        peer.HandshakeStartTimestamp = Stopwatch.GetTimestamp();
+                    }
+
                     InvokePeerConnectedIsolated(peer);
                     break;
                 }
@@ -1339,6 +1493,80 @@ namespace Krut.Netcode
             }
         }
 
+        private void CheckKeyExchangeTimeouts()
+        {
+            int timeoutMs = Config.Encryption!.HandshakeTimeoutMs;
+            long now = Stopwatch.GetTimestamp();
+            double toMs = 1000.0 / Stopwatch.Frequency;
+
+            foreach (var peer in _peers.Values)
+            {
+                if (peer.SessionCrypto is not null || peer.HandshakeStartTimestamp == 0)
+                    continue;
+
+                if ((now - peer.HandshakeStartTimestamp) * toMs > timeoutMs)
+                {
+                    peer.HandshakeStartTimestamp = 0;
+                    FailHandshake(peer, $"Per-peer encryption handshake timed out after {timeoutMs} ms.");
+                }
+            }
+        }
+
+        private void BeginServerKeyExchange(NetworkPeerState peer)
+        {
+            PeerSessionCrypto.CreateEphemeralKeyPair(out var ecdh, out var serverPub);
+            byte[] serverNonce = new byte[PeerSessionCrypto.NonceBytes];
+            RandomNumberGenerator.Fill(serverNonce);
+
+            peer.DisposeCrypto();
+            peer.PendingEcdh = ecdh;
+            peer.PendingServerPubKey = serverPub;
+            peer.PendingServerNonce = serverNonce;
+            peer.HandshakeStartTimestamp = Stopwatch.GetTimestamp();
+
+            byte[]? signature = _serverIdentitySigner is not null
+                ? PeerSessionCrypto.SignServerTranscript(_serverIdentitySigner, Config.ApplicationId, Config.ProtocolVersion, serverPub, serverNonce)
+                : null;
+
+            var writer = AcquireWriter();
+            try
+            {
+                writer.Put((byte)NetworkMessageType.KeyExchangeHello);
+                writer.Put(serverPub);
+                writer.Put(serverNonce);
+                if (signature is not null)
+                {
+                    writer.Put((byte)1);
+                    writer.Put(signature);
+                }
+                else
+                {
+                    writer.Put((byte)0);
+                }
+
+                SendWriterToPeer(
+                    peer,
+                    writer,
+                    NetworkDelivery.ReliableOrdered,
+                    DeliveryMethod.ReliableOrdered,
+                    NetworkChannels.Control,
+                    NetworkMessageType.KeyExchangeHello,
+                    _simulation is { IsActive: true });
+            }
+            finally
+            {
+                ReleaseWriter(writer);
+            }
+        }
+
+        private void FailHandshake(NetworkPeerState? peer, string reason)
+        {
+            EncryptionStats.IncrementKeyExchangesFailed();
+            ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, reason, peer?.Id ?? -1));
+            peer?.DisposeCrypto();
+            peer?.Disconnect(null);
+        }
+
         private void DecodeAndDeliver(NetworkEvent networkEvent)
         {
             var reader = _reader;
@@ -1352,7 +1580,323 @@ namespace Krut.Netcode
                 return;
             }
 
+            if (typeByte == (byte)NetworkMessageType.KeyExchangeHello)
+            {
+                HandleKeyExchangeHello(networkEvent, reader);
+                return;
+            }
+
+            if (typeByte == (byte)NetworkMessageType.KeyExchangeReply)
+            {
+                HandleKeyExchangeReply(networkEvent, reader);
+                return;
+            }
+
+            if (typeByte == (byte)NetworkMessageType.EncryptedEnvelope)
+            {
+                DecodeEncryptedEnvelope(networkEvent, reader);
+                return;
+            }
+
+            if (_useSessionKeyExchange)
+            {
+                EncryptionStats.IncrementAuthFailures();
+                ReportSafely(new NetworkError(
+                    NetworkErrorCode.SecurityError,
+                    $"Rejected unencrypted message type {typeByte} on an encrypted session.",
+                    networkEvent.Peer!.Id));
+                return;
+            }
+
             DecodeMessageBody(networkEvent, reader, typeByte);
+        }
+
+        private void HandleKeyExchangeHello(NetworkEvent networkEvent, NetDataReader reader)
+        {
+            _peers.TryGetValue(networkEvent.Peer!.Id, out var peer);
+            if (IsServer || !_useSessionKeyExchange)
+            {
+                EncryptionStats.IncrementAuthFailures();
+                ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Unexpected KeyExchangeHello frame.", networkEvent.Peer!.Id));
+                return;
+            }
+
+            if (peer is null)
+            {
+                FailHandshake(null, "Received KeyExchangeHello for an unknown peer.");
+                return;
+            }
+
+            if (peer.SessionCrypto is not null)
+            {
+                EncryptionStats.IncrementReplays();
+                ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Ignored duplicate KeyExchangeHello on active encrypted session.", peer.Id));
+                return;
+            }
+
+            if (reader.AvailableBytes < PeerSessionCrypto.PublicKeyBytes + PeerSessionCrypto.NonceBytes + 1)
+            {
+                FailHandshake(peer, "Malformed KeyExchangeHello: truncated payload.");
+                return;
+            }
+
+            byte[] serverPub = new byte[PeerSessionCrypto.PublicKeyBytes];
+            reader.GetBytes(serverPub, PeerSessionCrypto.PublicKeyBytes);
+            byte[] serverNonce = new byte[PeerSessionCrypto.NonceBytes];
+            reader.GetBytes(serverNonce, PeerSessionCrypto.NonceBytes);
+            byte hasSig = reader.GetByte();
+            byte[]? signature = null;
+
+            if (hasSig == 1)
+            {
+                if (reader.AvailableBytes != PeerSessionCrypto.SignatureBytes)
+                {
+                    FailHandshake(peer, "Malformed KeyExchangeHello: invalid signature length.");
+                    return;
+                }
+
+                signature = new byte[PeerSessionCrypto.SignatureBytes];
+                reader.GetBytes(signature, PeerSessionCrypto.SignatureBytes);
+            }
+            else if (hasSig != 0 || reader.AvailableBytes != 0)
+            {
+                FailHandshake(peer, "Malformed KeyExchangeHello: invalid signature flag or trailing bytes.");
+                return;
+            }
+
+            if (_serverIdentityVerifier is not null)
+            {
+                if (signature is null || !PeerSessionCrypto.VerifyServerTranscript(
+                    _serverIdentityVerifier, Config.ApplicationId, Config.ProtocolVersion, serverPub, serverNonce, signature))
+                {
+                    FailHandshake(peer, "Server key-exchange identity signature verification failed.");
+                    return;
+                }
+            }
+
+            PeerSessionCrypto.CreateEphemeralKeyPair(out var clientEcdh, out var clientPub);
+            byte[] clientNonce = new byte[PeerSessionCrypto.NonceBytes];
+            RandomNumberGenerator.Fill(clientNonce);
+            try
+            {
+                if (!PeerSessionCrypto.TryDerive(
+                    clientEcdh,
+                    serverPub,
+                    serverPub,
+                    serverNonce,
+                    clientPub,
+                    clientNonce,
+                    Config.ApplicationId,
+                    Config.ProtocolVersion,
+                    isServer: false,
+                    Config.Encryption!.EnableAntiReplay,
+                    out var sessionCrypto,
+                    out var confirmMac)
+                    || sessionCrypto is null
+                    || confirmMac is null)
+                {
+                    FailHandshake(peer, "ECDH key agreement failed on client.");
+                    return;
+                }
+
+                var writer = AcquireWriter();
+                try
+                {
+                    writer.Put((byte)NetworkMessageType.KeyExchangeReply);
+                    writer.Put(clientPub);
+                    writer.Put(clientNonce);
+                    writer.Put(confirmMac);
+                    SendWriterToPeer(
+                        peer,
+                        writer,
+                        NetworkDelivery.ReliableOrdered,
+                        DeliveryMethod.ReliableOrdered,
+                        NetworkChannels.Control,
+                        NetworkMessageType.KeyExchangeReply,
+                        _simulation is { IsActive: true });
+                }
+                finally
+                {
+                    ReleaseWriter(writer);
+                }
+
+                peer.DisposeCrypto();
+                peer.SessionCrypto = sessionCrypto;
+                EncryptionStats.IncrementKeyExchangesCompleted();
+            }
+            finally
+            {
+                clientEcdh.Dispose();
+                CryptographicOperations.ZeroMemory(clientNonce);
+                CryptographicOperations.ZeroMemory(serverNonce);
+            }
+        }
+
+        private void HandleKeyExchangeReply(NetworkEvent networkEvent, NetDataReader reader)
+        {
+            _peers.TryGetValue(networkEvent.Peer!.Id, out var peer);
+            if (!IsServer || !_useSessionKeyExchange)
+            {
+                EncryptionStats.IncrementAuthFailures();
+                ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Unexpected KeyExchangeReply frame.", networkEvent.Peer!.Id));
+                return;
+            }
+
+            if (peer is not null && peer.SessionCrypto is not null)
+            {
+                EncryptionStats.IncrementReplays();
+                ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Ignored duplicate KeyExchangeReply on active encrypted session.", peer.Id));
+                return;
+            }
+
+            if (peer is null || peer.PendingEcdh is null || peer.PendingServerPubKey is null || peer.PendingServerNonce is null)
+            {
+                FailHandshake(peer, "Received KeyExchangeReply without a pending handshake.");
+                return;
+            }
+
+            const int expectedBytes = PeerSessionCrypto.PublicKeyBytes + PeerSessionCrypto.NonceBytes + PeerSessionCrypto.ConfirmMacBytes;
+            if (reader.AvailableBytes != expectedBytes)
+            {
+                FailHandshake(peer, "Malformed KeyExchangeReply: unexpected payload size.");
+                return;
+            }
+
+            byte[] clientPub = new byte[PeerSessionCrypto.PublicKeyBytes];
+            reader.GetBytes(clientPub, PeerSessionCrypto.PublicKeyBytes);
+            byte[] clientNonce = new byte[PeerSessionCrypto.NonceBytes];
+            reader.GetBytes(clientNonce, PeerSessionCrypto.NonceBytes);
+            byte[] clientMac = new byte[PeerSessionCrypto.ConfirmMacBytes];
+            reader.GetBytes(clientMac, PeerSessionCrypto.ConfirmMacBytes);
+
+            PeerSessionCrypto? sessionCrypto = null;
+            try
+            {
+                if (!PeerSessionCrypto.TryDerive(
+                    peer.PendingEcdh,
+                    clientPub,
+                    peer.PendingServerPubKey,
+                    peer.PendingServerNonce,
+                    clientPub,
+                    clientNonce,
+                    Config.ApplicationId,
+                    Config.ProtocolVersion,
+                    isServer: true,
+                    Config.Encryption!.EnableAntiReplay,
+                    out sessionCrypto,
+                    out var expectedMac)
+                    || sessionCrypto is null
+                    || expectedMac is null)
+                {
+                    sessionCrypto?.Dispose();
+                    FailHandshake(peer, "ECDH key agreement failed on server.");
+                    return;
+                }
+
+                if (!CryptographicOperations.FixedTimeEquals(clientMac, expectedMac))
+                {
+                    sessionCrypto.Dispose();
+                    FailHandshake(peer, "Key-exchange confirmation MAC mismatch.");
+                    return;
+                }
+
+                peer.DisposeCrypto();
+                peer.SessionCrypto = sessionCrypto;
+                EncryptionStats.IncrementKeyExchangesCompleted();
+            }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(clientNonce);
+            }
+
+            InvokePeerConnectedIsolated(peer);
+        }
+
+        private void DecodeEncryptedEnvelope(NetworkEvent networkEvent, NetDataReader reader)
+        {
+            if (!_useSessionKeyExchange
+                || !_peers.TryGetValue(networkEvent.Peer!.Id, out var peer)
+                || peer.SessionCrypto is not { } crypto)
+            {
+                EncryptionStats.IncrementAuthFailures();
+                ReportSafely(new NetworkError(
+                    NetworkErrorCode.SecurityError,
+                    "Received EncryptedEnvelope without an active encrypted session.",
+                    networkEvent.Peer!.Id));
+                return;
+            }
+
+            int bodyCapacity = networkEvent.Length - PeerSessionCrypto.EnvelopeOverheadBytes;
+            if (bodyCapacity <= 0)
+            {
+                EncryptionStats.IncrementMalformed();
+                ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Malformed encrypted envelope.", peer.Id));
+                return;
+            }
+
+            byte[]? rented = null;
+            Span<byte> plaintext = bodyCapacity <= 2048
+                ? stackalloc byte[2048]
+                : (rented = ArrayPool<byte>.Shared.Rent(bodyCapacity));
+            try
+            {
+                var result = crypto.TryDecryptEnvelope(
+                    networkEvent.Data.AsSpan(0, networkEvent.Length),
+                    (byte)networkEvent.Delivery,
+                    plaintext,
+                    out int plaintextLength);
+
+                if (result != PeerSessionCrypto.DecryptResult.Ok)
+                {
+                    switch (result)
+                    {
+                        case PeerSessionCrypto.DecryptResult.Replay:
+                            EncryptionStats.IncrementReplays();
+                            break;
+                        case PeerSessionCrypto.DecryptResult.AuthFailed:
+                            EncryptionStats.IncrementAuthFailures();
+                            ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Encrypted envelope authentication failed.", peer.Id));
+                            break;
+                        default:
+                            EncryptionStats.IncrementMalformed();
+                            ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Malformed encrypted envelope.", peer.Id));
+                            break;
+                    }
+
+                    return;
+                }
+
+                if (plaintextLength <= 0)
+                {
+                    EncryptionStats.IncrementMalformed();
+                    ReportSafely(new NetworkError(NetworkErrorCode.SecurityError, "Empty decrypted envelope.", peer.Id));
+                    return;
+                }
+
+                EncryptionStats.IncrementDecrypted();
+                plaintext.Slice(0, plaintextLength).CopyTo(networkEvent.Data!);
+                reader.SetSource(networkEvent.Data!, 0, plaintextLength);
+                byte innerType = reader.GetByte();
+
+                if (innerType == (byte)NetworkMessageType.KeyExchangeHello
+                    || innerType == (byte)NetworkMessageType.KeyExchangeReply
+                    || innerType == (byte)NetworkMessageType.EncryptedEnvelope)
+                {
+                    EncryptionStats.IncrementMalformed();
+                    ReportSafely(new NetworkError(
+                        NetworkErrorCode.SecurityError,
+                        $"Invalid inner message type {innerType} inside EncryptedEnvelope.",
+                        peer.Id));
+                    return;
+                }
+
+                DecodeMessageBody(networkEvent, reader, innerType);
+            }
+            finally
+            {
+                if (rented is not null)
+                    ArrayPool<byte>.Shared.Return(rented, clearArray: true);
+            }
         }
 
         private void DecodeMessageBody(NetworkEvent networkEvent, NetDataReader reader, byte typeByte)

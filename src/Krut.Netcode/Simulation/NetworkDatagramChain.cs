@@ -27,6 +27,7 @@ namespace Krut.Netcode
 
         private readonly PacketLayerBase[] _layers;
         private readonly NetworkDatagramSimLayer? _simLayer;
+        private readonly NetworkEncryptionLayer? _encryptionLayer;
 
         public NetworkDatagramChain(params PacketLayerBase[] layers)
             : base(SumExtra(layers))
@@ -36,11 +37,19 @@ namespace Krut.Netcode
             {
                 if (layer is NetworkDatagramSimLayer sim)
                     _simLayer = sim;
+                if (layer is NetworkEncryptionLayer enc)
+                    _encryptionLayer = enc;
             }
         }
 
         /// <summary>True when the chain holds a <see cref="NetworkDatagramSimLayer"/>.</summary>
         public bool HasSimulationLayer => _simLayer is not null;
+
+        /// <summary>True when the chain holds a <see cref="NetworkEncryptionLayer"/>.</summary>
+        public bool HasEncryptionLayer => _encryptionLayer is not null;
+
+        /// <summary>The <see cref="NetworkEncryptionLayer"/> in this chain, if present.</summary>
+        public NetworkEncryptionLayer? EncryptionLayer => _encryptionLayer;
 
         /// <summary>The simulation the datagram layer applies, or null. Setting it needs a simulation layer in the chain.</summary>
         public NetworkSimulation? Simulation
@@ -78,6 +87,15 @@ namespace Krut.Netcode
 
             for (int i = 0; i < _layers.Length && length > 0; i++)
                 _layers[i].ProcessOutBoundPacket(ref endPoint, ref data, ref offset, ref length);
+        }
+
+        internal NetworkDatagramChain WithPrependedLayer(PacketLayerBase layer)
+        {
+            ArgumentNullException.ThrowIfNull(layer);
+            var combined = new PacketLayerBase[_layers.Length + 1];
+            combined[0] = layer;
+            Array.Copy(_layers, 0, combined, 1, _layers.Length);
+            return new NetworkDatagramChain(combined);
         }
 
         private static int SumExtra(PacketLayerBase[] layers)

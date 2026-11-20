@@ -180,6 +180,12 @@ namespace Krut.Netcode
         /// </summary>
         public int MaxEventsPerDrain { get; set; }
 
+        /// <summary>
+        /// Optional transport/session encryption settings (PSK AES-256-GCM datagram encryption and/or per-peer
+        /// ephemeral ECDH P-256 session encryption). Leave <c>null</c> for plaintext UDP.
+        /// </summary>
+        public NetworkEncryptionConfig? Encryption { get; set; }
+
         /// <summary>Clamps the values to valid intervals.</summary>
         public void Validate()
         {
@@ -225,6 +231,11 @@ namespace Krut.Netcode
         public float TickInterval => 1f / TickRate;
 
         /// <summary>Copy of this setting (so that a session isn't affected if the game changes its own settings instance).</summary>
-        public NetworkConfig Clone() => (NetworkConfig)MemberwiseClone();
+        public NetworkConfig Clone()
+        {
+            var copy = (NetworkConfig)MemberwiseClone();
+            copy.Encryption = Encryption?.Clone();
+            return copy;
+        }
     }
 }
