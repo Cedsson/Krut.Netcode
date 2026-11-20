@@ -245,6 +245,8 @@ namespace Krut.Netcode
         /// <summary>Total length of the current smoothing in seconds; 0 means "no smoothing in progress".</summary>
         private float _smoothDuration;
 
+        private VisualSmoothingSettings _smoothing;
+
         /// <param name="capacity">
         /// How many unacknowledged inputs may remain before the oldest one is dropped. See
         /// <see cref="InputHistoryCapacity"/> for the memory cost.
@@ -252,15 +254,22 @@ namespace Krut.Netcode
         public NetworkReconciler(VisualSmoothingSettings smoothing, int capacity = DefaultInputHistoryCapacity)
         {
             Smoothing = smoothing;
-            Smoothing.Clamp();
             _history = new NetworkStateRing<ReconcileHistoryEntry<TState, TInput>>(
                 Math.Max(2, capacity),
                 static entry => entry.Tick);
             _replayScratch = new TInput[_history.Capacity];
         }
 
-        /// <summary>The settings in effect (copied in the ctor - change via <see cref="Smoothing"/> if you want to change it during a match).</summary>
-        public VisualSmoothingSettings Smoothing { get; set; }
+        /// <summary>The settings in effect (copied and clamped on assignment).</summary>
+        public VisualSmoothingSettings Smoothing
+        {
+            get => _smoothing;
+            set
+            {
+                value.Clamp();
+                _smoothing = value;
+            }
+        }
 
         /// <summary>The server's authoritative state for <see cref="AuthoritativeTick"/> - the truth.</summary>
         public TState AuthoritativeState => _authoritative;
@@ -555,11 +564,34 @@ namespace Krut.Netcode
             // Set before the work, so that even a correction aborted by an error
             // can't be run again by a repeated delivery of the same packet.
             _lastReconciledServerTick = serverTick;
-            return ReconcileCore(lastProcessedInputTick, replay);
+            return ReconcileCore(lastProcessedInputTick, replay, null);
+        }
+
+        /// <summary>
+        /// Overload of <see cref="Reconcile(int, int, Func{TState, int, TInput[], TState})"/> that passes the exact
+        /// number of unacknowledged inputs to replay as the fourth argument so callers do not iterate past the active
+        /// prefix of the reused scratch array.
+        /// </summary>
+        public int Reconcile(int serverTick, int lastProcessedInputTick, Func<TState, int, TInput[], int, TState> replay)
+        {
+            if (replay is null)
+                throw new ArgumentNullException(nameof(replay));
+
+            if (serverTick <= _lastReconciledServerTick || serverTick != AuthoritativeTick)
+            {
+                IgnoredServerStateCount++;
+                return 0;
+            }
+
+            _lastReconciledServerTick = serverTick;
+            return ReconcileCore(lastProcessedInputTick, null, replay);
         }
 
         /// <summary>Roll back and replay - see <see cref="Reconcile"/>, which owns the validation.</summary>
-        private int ReconcileCore(int lastProcessedInputTick, Func<TState, int, TInput[], TState> replay)
+        private int ReconcileCore(
+            int lastProcessedInputTick,
+            Func<TState, int, TInput[], TState>? replay,
+            Func<TState, int, TInput[], int, TState>? replayWithCount)
         {
             if (!_hasState)
             {
@@ -604,10 +636,13 @@ namespace Krut.Netcode
             PendingReplayCount = count;
             try
             {
-                corrected = replay(_authoritative, lastProcessedInputTick, _replayScratch);
+                corrected = replayWithCount is not null
+                    ? replayWithCount(_authoritative, lastProcessedInputTick, _replayScratch, count)
+                    : replay!(_authoritative, lastProcessedInputTick, _replayScratch);
             }
             finally
             {
+                Array.Clear(_replayScratch, 0, count);
                 PendingReplayCount = 0;
             }
 

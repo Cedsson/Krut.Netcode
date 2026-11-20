@@ -50,6 +50,9 @@ namespace Krut.Netcode
         /// <summary>The storage. Index 0 in ring terms is <c>_entries[_head]</c>, not <c>_entries[0]</c>.</summary>
         private readonly TEntry[] _entries;
 
+        /// <summary>Parallel tick storage so binary searches and bounds checks avoid copying <typeparamref name="TEntry"/>.</summary>
+        private readonly int[] _ticks;
+
         /// <summary>Where the next entry is written (modulo <see cref="_entries"/>'s length).</summary>
         private int _head;
 
@@ -68,6 +71,7 @@ namespace Krut.Netcode
                 throw new ArgumentNullException(nameof(tickOf));
 
             _entries = new TEntry[capacity];
+            _ticks = new int[capacity];
             _tickOf = tickOf;
         }
 
@@ -87,7 +91,7 @@ namespace Krut.Netcode
             {
                 if (Count == 0)
                     throw new InvalidOperationException("The ring is empty - there is no oldest tick.");
-                return _tickOf(this[0]);
+                return _ticks[_head];
             }
         }
 
@@ -98,7 +102,7 @@ namespace Krut.Netcode
             {
                 if (Count == 0)
                     throw new InvalidOperationException("The ring is empty - there is no newest tick.");
-                return _tickOf(this[Count - 1]);
+                return TickAt(Count - 1);
             }
         }
 
@@ -158,6 +162,7 @@ namespace Krut.Netcode
                 slot -= _entries.Length;
 
             _entries[slot] = entry;
+            _ticks[slot] = _tickOf(entry);
         }
 
         /// <summary>
@@ -168,7 +173,7 @@ namespace Krut.Netcode
         /// <param name="tick">The tick the entry applies to. Unit: ticks.</param>
         public bool Push(int tick, in TEntry entry)
         {
-            if (Count > 0 && tick <= _tickOf(this[Count - 1]))
+            if (Count > 0 && tick <= TickAt(Count - 1))
                 return false;
 
             if (Count == _entries.Length)
@@ -181,6 +186,7 @@ namespace Krut.Netcode
                     _head = 0;
 
                 _entries[oldestSlot] = entry;
+                _ticks[oldestSlot] = tick;
                 return true;
             }
 
@@ -189,6 +195,7 @@ namespace Krut.Netcode
                 slot -= _entries.Length;
 
             _entries[slot] = entry;
+            _ticks[slot] = tick;
             Count++;
             return true;
         }
@@ -201,7 +208,7 @@ namespace Krut.Netcode
         /// <param name="tick">The tick the entry applies to. Unit: ticks.</param>
         public bool PushOrOverwrite(int tick, in TEntry entry)
         {
-            if (Count > 0 && tick <= _tickOf(this[Count - 1]))
+            if (Count > 0 && tick <= TickAt(Count - 1))
                 return false;
 
             bool wasFull = Count == _entries.Length;
@@ -217,9 +224,10 @@ namespace Krut.Netcode
         public int RemoveAtOrBefore(int tick)
         {
             int removed = 0;
-            while (Count > 0 && _tickOf(this[0]) <= tick)
+            while (Count > 0 && _ticks[_head] <= tick)
             {
                 _entries[_head] = default;
+                _ticks[_head] = 0;
                 _head++;
                 if (_head == _entries.Length)
                     _head = 0;
@@ -235,6 +243,7 @@ namespace Krut.Netcode
         public void Clear()
         {
             Array.Clear(_entries);
+            Array.Clear(_ticks);
             _head = 0;
             Count = 0;
         }
@@ -253,7 +262,7 @@ namespace Krut.Netcode
             while (low <= high)
             {
                 int mid = low + ((high - low) / 2);
-                if (_tickOf(this[mid]) <= tick)
+                if (TickAt(mid) <= tick)
                 {
                     result = mid;
                     low = mid + 1;
@@ -265,6 +274,14 @@ namespace Krut.Netcode
             }
 
             return result;
+        }
+
+        private int TickAt(int index)
+        {
+            int slot = _head + index;
+            if (slot >= _entries.Length)
+                slot -= _entries.Length;
+            return _ticks[slot];
         }
     }
 
