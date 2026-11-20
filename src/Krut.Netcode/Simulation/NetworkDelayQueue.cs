@@ -16,6 +16,7 @@ namespace Krut.Netcode
         private const int UnreliableHeaderBytes = 1;
         private const int ChanneledHeaderBytes = 4;
         private const int MaxLinks = 256;
+        private const int MaxDelayedPackets = 4096;
 
         private readonly List<DelayedOutbound> _delayed = new();
         private readonly List<PeerLink> _links = new();
@@ -46,6 +47,13 @@ namespace Krut.Netcode
             if (!verdict.Deliver)
                 return;
 
+            if (_delayed.Count >= MaxDelayedPackets && (!reliable || !TryEvictOneUnreliable()))
+            {
+                _stats.IncrementDropped();
+                _stats.IncrementDroppedOverflow();
+                return;
+            }
+
             // Pooled array copy instead of a reference to writer.Data: the writer is reused by the next Send.
             int length = writer.Length;
             byte[] data = ArrayPool<byte>.Shared.Rent(length);
@@ -54,10 +62,34 @@ namespace Krut.Netcode
             InsertSorted(new DelayedOutbound(peer, data, length, channel, method, verdict.DueUs, reliable));
             if (verdict.Duplicate)
             {
+                if (_delayed.Count >= MaxDelayedPackets && (!reliable || !TryEvictOneUnreliable()))
+                {
+                    _stats.IncrementDropped();
+                    _stats.IncrementDroppedOverflow();
+                    return;
+                }
+
                 byte[] duplicateData = ArrayPool<byte>.Shared.Rent(length);
                 Buffer.BlockCopy(writer.Data, 0, duplicateData, 0, length);
                 InsertSorted(new DelayedOutbound(peer, duplicateData, length, channel, method, verdict.DuplicateDueUs, reliable));
             }
+        }
+
+        private bool TryEvictOneUnreliable()
+        {
+            for (int i = 0; i < _delayed.Count; i++)
+            {
+                if (!_delayed[i].Reliable)
+                {
+                    ArrayPool<byte>.Shared.Return(_delayed[i].Data);
+                    _delayed.RemoveAt(i);
+                    _stats.IncrementDropped();
+                    _stats.IncrementDroppedOverflow();
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private void InsertSorted(in DelayedOutbound item)
@@ -72,9 +104,18 @@ namespace Krut.Netcode
                 _delayed.Insert(index, item);
         }
 
-        /// <summary>Removes link state for a disconnected peer so repeated reconnects do not accumulate stale entries.</summary>
+        /// <summary>Removes link state and any queued delayed packets for a disconnected peer.</summary>
         public void RemovePeer(int peerId)
         {
+            for (int i = _delayed.Count - 1; i >= 0; i--)
+            {
+                if (_delayed[i].Peer.Id == peerId)
+                {
+                    ArrayPool<byte>.Shared.Return(_delayed[i].Data);
+                    _delayed.RemoveAt(i);
+                }
+            }
+
             for (int i = _links.Count - 1; i >= 0; i--)
             {
                 if (_links[i].Peer.Id == peerId)
@@ -83,21 +124,37 @@ namespace Krut.Netcode
         }
 
         /// <summary>Sends every queued packet now; used when the simulation is switched off.</summary>
-        public void SendAll()
+        public void SendAll(Action<NetworkError>? onError = null)
         {
-            foreach (var delayed in _delayed)
+            try
             {
-                try
+                foreach (var delayed in _delayed)
                 {
-                    delayed.Peer.Peer.Send(delayed.Data, 0, delayed.Length, delayed.Channel, delayed.Method);
-                }
-                finally
-                {
-                    ArrayPool<byte>.Shared.Return(delayed.Data);
+                    try
+                    {
+                        delayed.Peer.Peer.Send(delayed.Data, 0, delayed.Length, delayed.Channel, delayed.Method);
+                    }
+                    catch (LiteNetLib.TooBigPacketException)
+                    {
+                        onError?.Invoke(new NetworkError(
+                            NetworkErrorCode.PacketTooLarge,
+                            $"Delayed packet ({delayed.Length} bytes) did not fit in a packet - split it up or use a reliable channel.",
+                            delayed.Peer.Id));
+                    }
+                    catch (Exception)
+                    {
+                        // Never allow a per-packet failure to abort releasing pooled buffers.
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(delayed.Data);
+                    }
                 }
             }
-
-            _delayed.Clear();
+            finally
+            {
+                _delayed.Clear();
+            }
         }
 
         public void Clear()
@@ -115,7 +172,7 @@ namespace Krut.Netcode
         /// Sends the packets whose due time has passed, in chronological <c>DueUs</c> order, and removes them. A packet
         /// that falls due inside an outage is lost (unreliable) or held until the outage ends (reliable).
         /// </summary>
-        public bool FlushDue()
+        public bool FlushDue(Action<NetworkError>? onError = null)
         {
             if (_delayed.Count == 0 || _bound is null)
                 return false;
@@ -126,7 +183,8 @@ namespace Krut.Netcode
             bool sent = false;
             bool outageRescheduled = false;
             int kept = 0;
-            for (int i = 0; i < _delayed.Count; i++)
+            int total = _delayed.Count;
+            for (int i = 0; i < total; i++)
             {
                 var delayed = _delayed[i];
                 if (delayed.DueUs > now)
@@ -146,8 +204,8 @@ namespace Krut.Netcode
                     else
                     {
                         ArrayPool<byte>.Shared.Return(delayed.Data);
-                        _stats.Dropped++;
-                        _stats.DroppedOutage++;
+                        _stats.IncrementDropped();
+                        _stats.IncrementDroppedOutage();
                     }
 
                     continue;
@@ -158,13 +216,25 @@ namespace Krut.Netcode
                     delayed.Peer.Peer.Send(delayed.Data, 0, delayed.Length, delayed.Channel, delayed.Method);
                     sent = true;
                 }
+                catch (LiteNetLib.TooBigPacketException)
+                {
+                    onError?.Invoke(new NetworkError(
+                        NetworkErrorCode.PacketTooLarge,
+                        $"Delayed packet ({delayed.Length} bytes) did not fit in a packet - split it up or use a reliable channel.",
+                        delayed.Peer.Id));
+                }
+                catch (Exception)
+                {
+                    // Never allow a single failed packet send to leak remaining pooled buffers or crash Update.
+                }
                 finally
                 {
                     ArrayPool<byte>.Shared.Return(delayed.Data);
                 }
             }
 
-            _delayed.RemoveRange(kept, _delayed.Count - kept);
+            if (kept < _delayed.Count)
+                _delayed.RemoveRange(kept, _delayed.Count - kept);
             if (outageRescheduled && _delayed.Count > 1)
                 _delayed.Sort(static (a, b) => a.DueUs.CompareTo(b.DueUs));
             return sent;

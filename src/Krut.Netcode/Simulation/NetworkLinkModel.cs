@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 
 namespace Krut.Netcode
 {
@@ -24,32 +25,69 @@ namespace Krut.Netcode
         bool Duplicate,
         long DuplicateDueUs);
 
-    /// <summary>Counters of one simulated direction.</summary>
+    /// <summary>Thread-safe counters of one simulated direction.</summary>
     public sealed class NetworkSimulationStats
     {
-        public long Submitted { get; internal set; }
+        private long _submitted;
+        private long _bytesSubmitted;
+        private long _dropped;
+        private long _droppedRandom;
+        private long _droppedBurst;
+        private long _droppedOverflow;
+        private long _droppedOutage;
+        private long _duplicated;
+        private long _reordered;
+        private long _queueDelayMaxUs;
 
-        public long BytesSubmitted { get; internal set; }
+        public long Submitted { get => Interlocked.Read(ref _submitted); internal set => Interlocked.Exchange(ref _submitted, value); }
+
+        public long BytesSubmitted { get => Interlocked.Read(ref _bytesSubmitted); internal set => Interlocked.Exchange(ref _bytesSubmitted, value); }
 
         /// <summary>Messages that never arrive plus reliable ones that arrive late because they were "dropped".</summary>
-        public long Dropped { get; internal set; }
+        public long Dropped { get => Interlocked.Read(ref _dropped); internal set => Interlocked.Exchange(ref _dropped, value); }
 
-        public long DroppedRandom { get; internal set; }
+        public long DroppedRandom { get => Interlocked.Read(ref _droppedRandom); internal set => Interlocked.Exchange(ref _droppedRandom, value); }
 
-        public long DroppedBurst { get; internal set; }
+        public long DroppedBurst { get => Interlocked.Read(ref _droppedBurst); internal set => Interlocked.Exchange(ref _droppedBurst, value); }
 
-        public long DroppedOverflow { get; internal set; }
+        public long DroppedOverflow { get => Interlocked.Read(ref _droppedOverflow); internal set => Interlocked.Exchange(ref _droppedOverflow, value); }
 
-        public long DroppedOutage { get; internal set; }
+        public long DroppedOutage { get => Interlocked.Read(ref _droppedOutage); internal set => Interlocked.Exchange(ref _droppedOutage, value); }
 
-        public long Duplicated { get; internal set; }
+        public long Duplicated { get => Interlocked.Read(ref _duplicated); internal set => Interlocked.Exchange(ref _duplicated, value); }
 
-        public long Reordered { get; internal set; }
+        public long Reordered { get => Interlocked.Read(ref _reordered); internal set => Interlocked.Exchange(ref _reordered, value); }
 
         /// <summary>Longest wait in the bandwidth queue, microseconds.</summary>
-        public long QueueDelayMaxUs { get; internal set; }
+        public long QueueDelayMaxUs { get => Interlocked.Read(ref _queueDelayMaxUs); internal set => Interlocked.Exchange(ref _queueDelayMaxUs, value); }
 
         public double QueueDelayMaxMs => QueueDelayMaxUs / 1000.0;
+
+        internal void AddSubmitted(int wireBytes)
+        {
+            Interlocked.Increment(ref _submitted);
+            Interlocked.Add(ref _bytesSubmitted, wireBytes);
+        }
+
+        internal void IncrementDropped() => Interlocked.Increment(ref _dropped);
+        internal void IncrementDroppedRandom() => Interlocked.Increment(ref _droppedRandom);
+        internal void IncrementDroppedBurst() => Interlocked.Increment(ref _droppedBurst);
+        internal void IncrementDroppedOverflow() => Interlocked.Increment(ref _droppedOverflow);
+        internal void IncrementDroppedOutage() => Interlocked.Increment(ref _droppedOutage);
+        internal void IncrementDuplicated() => Interlocked.Increment(ref _duplicated);
+        internal void IncrementReordered() => Interlocked.Increment(ref _reordered);
+
+        internal void RaiseQueueDelayMaxUs(long waited)
+        {
+            long seen = Interlocked.Read(ref _queueDelayMaxUs);
+            while (waited > seen)
+            {
+                long previous = Interlocked.CompareExchange(ref _queueDelayMaxUs, waited, seen);
+                if (previous == seen)
+                    return;
+                seen = previous;
+            }
+        }
     }
 
     /// <summary>
@@ -113,8 +151,10 @@ namespace Krut.Netcode
         /// </summary>
         public NetworkLinkVerdict Submit(long nowUs, int wireBytes, bool reliable)
         {
-            Stats.Submitted++;
-            Stats.BytesSubmitted += wireBytes;
+            if (wireBytes < 0)
+                wireBytes = 0;
+
+            Stats.AddSubmitted(wireBytes);
 
             long resendUs = (long)(2.0 * _latencyUs);
 
@@ -140,8 +180,8 @@ namespace Krut.Netcode
 
                 releaseUs = TakeTokens(nowUs, wireBytes);
                 long waited = releaseUs - nowUs;
-                if (waited > Stats.QueueDelayMaxUs)
-                    Stats.QueueDelayMaxUs = waited;
+                if (waited > 0)
+                    Stats.RaiseQueueDelayMaxUs(waited);
             }
 
             NetworkDropCause cause = NetworkDropCause.None;
@@ -168,7 +208,7 @@ namespace Krut.Netcode
             {
                 dueUs += (long)(_reorderUs * (1.0 + _random.NextDouble()));
                 reordered = true;
-                Stats.Reordered++;
+                Stats.IncrementReordered();
             }
             else if (reliable)
             {
@@ -188,7 +228,7 @@ namespace Krut.Netcode
             if (_sim.DuplicateChance > 0f && _random.NextDouble() < _sim.DuplicateChance)
             {
                 duplicate = true;
-                Stats.Duplicated++;
+                Stats.IncrementDuplicated();
                 duplicateDue = dueUs + 500 + (long)(_random.NextDouble() * Math.Max(_jitterUs, 2000.0));
             }
 
@@ -200,20 +240,20 @@ namespace Krut.Netcode
 
         private void CountDrop(NetworkDropCause cause)
         {
-            Stats.Dropped++;
+            Stats.IncrementDropped();
             switch (cause)
             {
                 case NetworkDropCause.Random:
-                    Stats.DroppedRandom++;
+                    Stats.IncrementDroppedRandom();
                     break;
                 case NetworkDropCause.Burst:
-                    Stats.DroppedBurst++;
+                    Stats.IncrementDroppedBurst();
                     break;
                 case NetworkDropCause.Overflow:
-                    Stats.DroppedOverflow++;
+                    Stats.IncrementDroppedOverflow();
                     break;
                 case NetworkDropCause.Outage:
-                    Stats.DroppedOutage++;
+                    Stats.IncrementDroppedOutage();
                     break;
             }
         }

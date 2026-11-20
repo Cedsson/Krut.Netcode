@@ -45,8 +45,15 @@ namespace Krut.Netcode
             => Text(name) is { } t
                && double.TryParse(t, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) ? v : fallback;
 
-        /// <summary>The parsed value clamped to the range; the fallback is returned as given when the variable is unset or broken.</summary>
+        /// <summary>The parsed value clamped to the range; the fallback is returned as given when the variable is unset, unparsable, or non-finite.</summary>
         public static float Clamped(string name, float fallback, float min, float max)
-            => Text(name) is { } t && TryParseFloat(t, out float v) ? Math.Clamp(v, min, max) : fallback;
+        {
+            if (min > max)
+                (min, max) = (max, min);
+
+            return Text(name) is { } t && TryParseFloat(t, out float v) && float.IsFinite(v)
+                ? Math.Clamp(v, min, max)
+                : fallback;
+        }
     }
 }

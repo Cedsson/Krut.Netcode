@@ -64,21 +64,35 @@ namespace Krut.Netcode
 
         public override void ProcessInboundPacket(ref IPEndPoint endPoint, ref byte[] data, ref int length)
         {
+            if (data is null || length <= 0)
+                return;
+
             for (int i = _layers.Length - 1; i >= 0 && length > 0; i--)
                 _layers[i].ProcessInboundPacket(ref endPoint, ref data, ref length);
         }
 
         public override void ProcessOutBoundPacket(ref IPEndPoint endPoint, ref byte[] data, ref int offset, ref int length)
         {
+            if (data is null || length <= 0)
+                return;
+
             for (int i = 0; i < _layers.Length && length > 0; i++)
                 _layers[i].ProcessOutBoundPacket(ref endPoint, ref data, ref offset, ref length);
         }
 
         private static int SumExtra(PacketLayerBase[] layers)
         {
+            if (layers is null)
+                throw new ArgumentNullException(nameof(layers));
+
             int sum = 0;
-            foreach (var layer in layers ?? throw new ArgumentNullException(nameof(layers)))
-                sum += layer.ExtraPacketSizeForLayer;
+            for (int i = 0; i < layers.Length; i++)
+            {
+                if (layers[i] is null)
+                    throw new ArgumentException($"Layer at index {i} must not be null.", nameof(layers));
+                sum += layers[i].ExtraPacketSizeForLayer;
+            }
+
             return sum;
         }
     }

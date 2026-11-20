@@ -250,7 +250,7 @@ namespace Krut.Netcode
             if (KrutEnv.Text(DuplicateVariable) is not null)
                 profile.DuplicateChance = KrutEnv.FloatLenient(DuplicateVariable, 0f);
             if (KrutEnv.Text(BandwidthVariable) is not null)
-                profile.ServerSendBytesPerSecond = (int)Math.Min(int.MaxValue, KrutEnv.Int(BandwidthVariable, 0) * 125L);
+                profile.ServerSendBytesPerSecond = (int)Math.Clamp(KrutEnv.Int(BandwidthVariable, 0) * 125L, 0L, int.MaxValue);
             if (KrutEnv.Text(OutagesVariable) is { } outageText)
                 profile.Outages = ParseOutages(outageText);
 
@@ -273,6 +273,7 @@ namespace Krut.Netcode
                 if (parts.Length == 2 &&
                     KrutEnv.TryParseFloatLenient(parts[0].Trim(), out float start) &&
                     KrutEnv.TryParseFloatLenient(parts[1].Trim(), out float length) &&
+                    float.IsFinite(start) && float.IsFinite(length) &&
                     start >= 0f && length > 0f)
                 {
                     list.Add(new NetworkOutage(start, length));

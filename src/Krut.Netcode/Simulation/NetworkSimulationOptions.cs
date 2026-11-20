@@ -70,7 +70,7 @@ namespace Krut.Netcode
         public NetworkSimulationOptions Clone()
         {
             var copy = (NetworkSimulationOptions)MemberwiseClone();
-            copy.Outages = new List<NetworkOutage>(Outages);
+            copy.Outages = Outages is not null ? new List<NetworkOutage>(Outages) : new List<NetworkOutage>();
             return copy;
         }
     }
