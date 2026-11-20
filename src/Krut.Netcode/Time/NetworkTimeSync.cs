@@ -78,6 +78,9 @@ namespace Krut.Netcode
         /// </summary>
         public const double MaxRttRatio = 2.0;
 
+        /// <summary>Upper bound for sane RTT samples (10 minutes) to guard against arithmetic overflow from bad inputs.</summary>
+        public const double MaxReasonableRoundTripSeconds = 600.0;
+
         /// <summary>Each sample's round-trip time, in seconds, in ring form.</summary>
         private readonly double[] _roundTrip;
 
@@ -89,6 +92,8 @@ namespace Krut.Netcode
 
         /// <summary>Scratch space for the median calculation - reused so nothing is allocated per sample.</summary>
         private readonly double[] _medianScratch;
+
+        private int _extraLeadTicks;
 
         /// <summary>Valid entries in the sample window: 0..<see cref="SampleCapacity"/>. Only entries 0.._sampleCount-1 are read.</summary>
         private int _sampleCount;
@@ -154,8 +159,12 @@ namespace Krut.Netcode
         /// <summary>The size of the sample window (see <see cref="DefaultSampleCapacity"/>).</summary>
         public int SampleCapacity { get; }
 
-        /// <summary>The margin on top of half the RTT, in ticks.</summary>
-        public int ExtraLeadTicks { get; set; }
+        /// <summary>The margin on top of half the RTT, in ticks (negative values clamp to 0).</summary>
+        public int ExtraLeadTicks
+        {
+            get => _extraLeadTicks;
+            set => _extraLeadTicks = Math.Max(0, value);
+        }
 
         /// <summary>
         /// True as soon as at least one sample has arrived. False means offset and lead are 0 - the game should
@@ -178,10 +187,10 @@ namespace Krut.Netcode
         public int TickOffset => _offsetTicks;
 
         /// <summary>Estimated one-way latency in ticks, computed from the smallest RTT in the window.</summary>
-        public int LatencyTicks => (int)Math.Round(_minRoundTripSeconds * TickRate * 0.5);
+        public int LatencyTicks => ClampRoundToInt(_minRoundTripSeconds * TickRate * 0.5);
 
         /// <summary>How much the RTT varies in the window, in ticks (max - min).</summary>
-        public int JitterTicks => (int)Math.Round((_maxRoundTripSeconds - _minRoundTripSeconds) * TickRate);
+        public int JitterTicks => ClampRoundToInt((_maxRoundTripSeconds - _minRoundTripSeconds) * TickRate);
 
         /// <summary>Smallest measured round-trip time in the window, in seconds (the "clean" latency).</summary>
         public double MinRoundTripSeconds => _minRoundTripSeconds;
@@ -310,6 +319,9 @@ namespace Krut.Netcode
         /// </param>
         public void RecordResponse(int clientTickAtSend, int serverTick, double roundTripSeconds)
         {
+            if (!IsValidRoundTrip(roundTripSeconds))
+                return;
+
             while (_pendingCount > 0 && _pendingTicks[_pendingHead] <= clientTickAtSend)
             {
                 _pendingHead = (_pendingHead + 1) % SampleCapacity;
@@ -324,10 +336,13 @@ namespace Krut.Netcode
         /// always if no sample has arrived at all (then it should try again as soon as possible).
         /// </summary>
         /// <param name="clientTick">
-        /// The client's current tick. Unit: ticks; negative values are never produced by the session clock.
+        /// The client's current tick. Unit: ticks; negative values return false.
         /// </param>
         public bool ShouldProbe(int clientTick)
         {
+            if (clientTick < 0)
+                return false;
+
             // Wait until the newest unanswered request is at least one probe interval old so a lost UDP packet
             // does not stall probing permanently.
             int interval = IsSynchronized ? RecommendedProbeIntervalTicks : FirstSyncProbeIntervalTicks;
@@ -361,7 +376,7 @@ namespace Krut.Netcode
         /// <summary>
         /// The median of all the samples, rounded - that is, the method the server's client should not use.
         /// </summary>
-        public int NaiveAverageOffsetTicks => (int)Math.Round(_naiveAverageTicks);
+        public int NaiveAverageOffsetTicks => ClampRoundToInt(_naiveAverageTicks);
 
         /// <summary><inheritdoc/></summary>
         public override string ToString()
@@ -406,9 +421,8 @@ namespace Krut.Netcode
         /// </summary>
         private void AddSample(int clientTickAtSend, int serverTick, double roundTripSeconds)
         {
-            // Junk data (a negative or non-finite round-trip time) would destroy both the minimum and the
-            // median, so it is discarded instead of repaired.
-            if (!(roundTripSeconds >= 0d) || double.IsInfinity(roundTripSeconds))
+            // Junk data (negative, non-finite, or absurdly large RTT) would corrupt minimum/median calculations.
+            if (!IsValidRoundTrip(roundTripSeconds))
                 return;
 
             _roundTrip[_nextSample] = roundTripSeconds;
@@ -443,9 +457,8 @@ namespace Krut.Netcode
             _maxRoundTripSeconds = maxRtt;
             _naiveAverageTicks = sum / _sampleCount;
 
-            // The filter's threshold: the best sample always gets in, and so does
-            // every sample at most MaxRttRatio times as long as the best one.
-            double threshold = minRtt * MaxRttRatio;
+            // Keep a small positive floor (1 ms) when minRtt == 0 on fast loopback so sub-ms samples survive filtering.
+            double threshold = minRtt > 0d ? minRtt * MaxRttRatio : 0.001;
             int kept = 0;
             for (int i = 0; i < _sampleCount; i++)
             {
@@ -457,9 +470,7 @@ namespace Krut.Netcode
 
             if (kept == 0)
             {
-                // Cannot happen (the smallest RTT is by definition at or below the threshold), but a fallback
-                // to one value is cheaper than an IndexOutOfRangeException in the middle of a tick.
-                _offsetTicks = (int)Math.Round(_naiveAverageTicks);
+                _offsetTicks = ClampRoundToInt(_naiveAverageTicks);
                 return;
             }
 
@@ -470,7 +481,23 @@ namespace Krut.Netcode
                 ? _medianScratch[kept / 2]
                 : (_medianScratch[kept / 2 - 1] + _medianScratch[kept / 2]) * 0.5;
 
-            _offsetTicks = (int)Math.Round(median);
+            _offsetTicks = ClampRoundToInt(median);
+        }
+
+        private static bool IsValidRoundTrip(double roundTripSeconds) =>
+            double.IsFinite(roundTripSeconds) && roundTripSeconds >= 0d && roundTripSeconds <= MaxReasonableRoundTripSeconds;
+
+        private static int ClampRoundToInt(double value)
+        {
+            if (!double.IsFinite(value))
+                return 0;
+
+            double rounded = Math.Round(value);
+            if (rounded >= int.MaxValue)
+                return int.MaxValue;
+            if (rounded <= int.MinValue)
+                return int.MinValue;
+            return (int)rounded;
         }
     }
 }

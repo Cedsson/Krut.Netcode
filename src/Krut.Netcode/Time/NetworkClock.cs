@@ -60,6 +60,18 @@ namespace Krut.Netcode
         /// <summary>The session's time in seconds (tick * tick interval), comparable between server and client.</summary>
         public double Time => Tick * TickInterval;
 
+        /// <summary>Number of whole ticks released by the most recent <see cref="Advance"/> call.</summary>
+        public int LastReleasedTickCount { get; private set; }
+
+        /// <summary>Number of excess ticks discarded by catch-up clamping during the most recent <see cref="Advance"/> call.</summary>
+        public int LastClampedTickCount { get; private set; }
+
+        /// <summary>Total number of ticks discarded by catch-up clamping across the lifetime of this clock.</summary>
+        public long TotalClampedTicks { get; private set; }
+
+        /// <summary>Number of <see cref="Advance"/> calls that hit <c>maxCatchUpTicks</c> and discarded excess ticks.</summary>
+        public long CatchUpClampCount { get; private set; }
+
         /// <summary>
         /// Advances time and calls <paramref name="onTick"/> once per whole tick that has passed. Why catch-up
         /// is clamped, and what a clamped frame means for simulation determinism. Without it, a 3 second
@@ -77,6 +89,9 @@ namespace Krut.Netcode
         /// </summary>
         public void Advance(float deltaSeconds, Action onTick)
         {
+            LastReleasedTickCount = 0;
+            LastClampedTickCount = 0;
+
             if (float.IsFinite(deltaSeconds) && deltaSeconds > 0f)
             {
                 _accumulator += deltaSeconds;
@@ -89,8 +104,23 @@ namespace Krut.Netcode
                     onTick();
                 }
 
+                LastReleasedTickCount = released;
+
                 if (_accumulator >= TickInterval)
+                {
+                    double excessTicks = Math.Floor(_accumulator / TickInterval);
+                    int clamped = excessTicks >= int.MaxValue ? int.MaxValue : (int)excessTicks;
+                    if (clamped > 0)
+                    {
+                        LastClampedTickCount = clamped;
+                        TotalClampedTicks += clamped;
+                        CatchUpClampCount++;
+                    }
+
                     _accumulator %= TickInterval;
+                    if (!double.IsFinite(_accumulator) || _accumulator < 0d)
+                        _accumulator = 0d;
+                }
             }
         }
 

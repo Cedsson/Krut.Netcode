@@ -177,6 +177,18 @@ namespace Krut.Netcode
         /// <summary>Number of messages that could not be decoded (too short a packet, broken header).</summary>
         public int MalformedMessageCount { get; private set; }
 
+        /// <summary>Number of whole ticks released during the most recent <see cref="Update"/>.</summary>
+        public int LastReleasedTickCount => _clock.LastReleasedTickCount;
+
+        /// <summary>Number of excess ticks discarded by catch-up clamping during the most recent <see cref="Update"/>.</summary>
+        public int LastClampedTickCount => _clock.LastClampedTickCount;
+
+        /// <summary>Total ticks discarded by catch-up clamping across the session lifetime.</summary>
+        public long TotalClampedTicks => _clock.TotalClampedTicks;
+
+        /// <summary>Number of <see cref="Update"/> frames that hit <see cref="NetworkConfig.MaxCatchUpTicks"/>.</summary>
+        public long CatchUpClampCount => _clock.CatchUpClampCount;
+
         /// <summary>Number of packets the simulation has thrown away.</summary>
         public int DroppedPacketCount => _delayQueue.DroppedCount;
 
