@@ -15,10 +15,10 @@ file names are given so the claim can be re-checked. Out-of-scope items are out 
   10 s outage takes 10 s. Delay is applied per message rather than per UDP packet, and releases
   happen inside `Update`, so the effective resolution is the update cadence
   (`Simulation/NetworkSimulation.cs` class summary).
-- **Only two of the four channels are routed.** `NetworkChannels.For` in
-  `Messages/NetworkProtocol.cs` maps unreliable to `Snapshot` and everything reliable to `Events`.
-  `Input` (0) and `Control` (3) are defined but nothing selects them, so today the separation is
-  two LiteNetLib queues, not four.
+- **Default routing uses two channels, with opt-in override for all four.** `NetworkChannels.For` in
+  `Messages/NetworkProtocol.cs` maps unreliable to `Snapshot` and everything reliable to `Events`
+  by default. `INetworkMessage.Channel` allows messages to override the channel (`WelcomeMessage`
+  routes to `Control`), while `Input` (0) remains opt-in per game message.
 - **Leftover wording in the source.** Several XML comments still refer to "the engine", requirement
   ids (R2, R6) or a "car"; the code is generic.
 - **Built-in chat and lobby messages.** `SystemChat`, `Chat` and `PlayerInfo` are built into the
@@ -39,8 +39,9 @@ file names are given so the claim can be re-checked. Out-of-scope items are out 
 
 ## Next steps
 
-1. Route `Input` and `Control` in `NetworkChannels.For` (for example a per-message channel
-   override on `INetworkMessage`), keeping the default stable for existing wire behaviour.
+1. Consider routing `Input` automatically or adding a dedicated unreliable input base channel helper
+   (per-message override via `INetworkMessage.Channel` is now available, and `WelcomeMessage` uses
+   `Control`).
 2. Give the demo separate processes (or separate polling loops) so the measured RTT matches the
    configured one, and add a `--seed` flag for repeatable runs.
 3. A virtual-clock mode for the delay queue so simulation tests run faster than real time and
