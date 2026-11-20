@@ -4,6 +4,24 @@ All notable changes to Krut.Netcode are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [1.0.2](https://github.com/Cedsson/Krut.Netcode/compare/v1.0.1...v1.0.2) (2026-11-20)
+
+
+### Bug Fixes
+
+* **session:** enforce MaxClients with approval, reject spoofed SystemChat and trailing bytes, and allow restart after Stop ([e2ab76f](https://github.com/Cedsson/Krut.Netcode/commit/e2ab76f8dc0e157990f1ea4d4034ccde2780b099))
+
+
+### Build and Dependencies
+
+* **deps:** bump the actions-dependencies group with 2 updates ([#10](https://github.com/Cedsson/Krut.Netcode/issues/10)) ([f702052](https://github.com/Cedsson/Krut.Netcode/commit/f7020521ddbeef4e3f73c87002a503efa2cfb678))
+* **deps:** bump the nuget-dependencies group with 2 updates ([d30ebd2](https://github.com/Cedsson/Krut.Netcode/commit/d30ebd262c2cf1ddaf3260fcf516faab4ef7fe46))
+
+
+### Performance
+
+* **netcode:** add fast-slot message pooling and SIMD-accelerate NetworkStateBlend ([f7a53a8](https://github.com/Cedsson/Krut.Netcode/commit/f7a53a8b5708a3567f1b62f36429791f79ec75d9))
+
 ### [1.0.1](https://github.com/Cedsson/Krut.Netcode/compare/v1.0.0...v1.0.1) (2026-11-20)
 
 
