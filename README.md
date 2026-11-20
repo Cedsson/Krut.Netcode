@@ -1,96 +1,258 @@
+<div align="center">
+
+<img src="assets/icon.svg" alt="Krut.Netcode" width="96" height="96" />
+
 # Krut.Netcode
 
+**Deterministic, zero-allocation, Native-AOT authoritative-server netcode for .NET 9 on LiteNetLib.**
+
 [![CI](https://github.com/Cedsson/Krut.Netcode/actions/workflows/ci.yml/badge.svg)](https://github.com/Cedsson/Krut.Netcode/actions/workflows/ci.yml)
-[![NuGet](https://img.shields.io/nuget/v/Krut.Netcode.svg)](https://www.nuget.org/packages/Krut.Netcode)
+[![NuGet](https://img.shields.io/nuget/v/Krut.Netcode.svg?logo=nuget)](https://www.nuget.org/packages/Krut.Netcode)
+[![NuGet Downloads](https://img.shields.io/nuget/dt/Krut.Netcode.svg?logo=nuget)](https://www.nuget.org/packages/Krut.Netcode)
+[![.NET 9](https://img.shields.io/badge/.NET-9.0%20%7C%20Native%20AOT-512BD4?logo=dotnet)](https://dotnet.microsoft.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Authoritative-server netcode for .NET on LiteNetLib: handshake, fixed tick clock, time sync,
-client prediction with reconciliation, snapshot interpolation, and a link simulator to prove it
-works on a bad network.
+[Quick Start](#quick-start) • [Architecture](#architecture) • [Prediction & Interpolation](#client-prediction--interpolation) • [Link Simulator](#network-link-simulator) • [Benchmarks](#benchmarks) • [Documentation](#documentation)
 
-## Features
+</div>
 
-- Handshake with application id, protocol version and name; the server rejects with a readable reason
-- Fixed tick clock, independent of frame rate, with a catch-up cap
-- NTP-style time sync using the median offset of the lowest-RTT samples
-- Client prediction and reconciliation: rewind to the acknowledged input, replay the rest, ease the visible correction
-- Snapshot interpolation with bounded extrapolation, then hold
-- Pooled messages with hand-written serialization; steady state allocates nothing per packet
-- Four channels defined (input, snapshot, events, control); unreliable messages are routed to Snapshot and reliable ones to Events today, so state never queues behind an event. Input and Control routing is on the roadmap
-- Link simulator: delay, jitter, loss, loss bursts, reorder, duplicates, outages and a bandwidth cap, switched on with `KRUT_NET_*` environment variables, repeatable with a seed
-- Native-AOT safe: no reflection; the only dependencies are LiteNetLib 2.1.4 and `System.Numerics`
+---
 
-## How it fits together
+## Overview
 
+**Krut.Netcode** is a lightweight, engine-agnostic multiplayer networking library built on top of [LiteNetLib](https://github.com/RevenantX/LiteNetLib) and `System.Numerics`. Extracted from the dedicated server and client engine of *Krut.Racing*, it provides the core primitives needed for fast-paced, authoritative-server multiplayer games without tying you to a specific game engine, scene graph, or reflection-heavy serializer.
+
+### Key Capabilities
+
+| Area | What Krut.Netcode Provides |
+| :--- | :--- |
+| **Session & Handshake** | `NetworkServer` and `NetworkClient` with application ID, protocol version, sanitized player names, custom `ConnectionApproval`, explicit rejection reasons, and library-managed auto-reconnect. |
+| **Zero-Allocation Messaging** | Static per-type pools (`NetworkMessagePool<T>`), single-pass `Broadcast` serialization, `ArrayPool<byte>` receive buffers, and explicit `NetDataWriter`/`NetDataReader` codecs (`0 B` allocated per packet in steady state). |
+| **Native-AOT Ready** | Zero runtime reflection, zero dynamic code generation, and zero attribute scanning. Verified in CI with `PublishAot=true` and trim/AOT warnings treated as errors. |
+| **Fixed-Tick Clock & Time Sync** | Frame-rate-independent `NetworkClock` with catch-up clamping, plus NTP-style `NetworkTimeSync` using minimum-RTT filtering and a rolling median offset. |
+| **Client Prediction & Replay** | `NetworkReconciler<TState, TInput>` with ring-buffered input history, authoritative rollback/replay, and exponential/ease-out visual error smoothing with teleport thresholds. |
+| **Snapshot Interpolation** | `NetworkSnapshotInterpolator<TState>` for remote entities with sub-tick rendering, bounded dead-reckoning extrapolation, and SIMD-accelerated component blending (`NetworkStateBlend`). |
+| **Deterministic Link Simulator** | Built-in `NetworkSimulation` (latency, jitter, Gilbert–Elliott burst loss, packet reorder, duplication, token-bucket bandwidth cap, and scheduled blackouts) at message or raw datagram level. |
+| **Hardened Wire Codec** | 16-bit quantized 3D positions and unit quaternions, non-finite (`NaN`/`Infinity`) sanitization, UTF-16 surrogate-safe truncation, control/Bidi-override stripping, and strict packet-length validation. |
+
+---
+
+## Installation
+
+Install from [NuGet](https://www.nuget.org/packages/Krut.Netcode):
+
+```bash
+dotnet add package Krut.Netcode
 ```
- server (headless, authoritative)                      client
- ------------------------------                        ------
- NetworkServer.OnTick (fixed tick)   <-- input ------  NetworkReconciler (own entity)
-   apply inputs, step simulation         (unreliable)     predict now, rewind + replay on snapshot
-   broadcast snapshot                 -- snapshot --->  NetworkSnapshotInterpolator (other entities)
-                                         (unreliable)     draw DelayTicks in the past
-   reliable events                    -- events ----->  NetworkTimeSync
-                                         (reliable)       median offset -> ResetClockTo(tick)
-        ^                                                       |
-        +-------- NetworkSimulation (loss, lag, jitter, ...) ---+
+
+---
+
+## Architecture
+
+Everything runs on the thread that calls `session.Update(deltaSeconds)` — no background callbacks into game logic and no locks required in user code.
+
+```mermaid
+flowchart LR
+    subgraph Client["Client (Predicts & Interpolates)"]
+        direction TB
+        CClock["NetworkTimeSync\nMin-RTT + Median Offset"]
+        CReconcile["NetworkReconciler&lt;TState, TInput&gt;\nPredict, Rollback & Visual Smoothing"]
+        CInterp["NetworkSnapshotInterpolator&lt;TState&gt;\nRender DelayTicks in Past"]
+    end
+
+    subgraph Link["UDP / LiteNetLib + NetworkSimulation"]
+        direction TB
+        Ch0["Channel 0: Input (Unreliable)"]
+        Ch1["Channel 1: Snapshot (Unreliable)"]
+        Ch2["Channel 2: Events (ReliableOrdered)"]
+        Ch3["Channel 3: Control (Reliable)"]
+    end
+
+    subgraph Server["Server (Headless, Authoritative)"]
+        direction TB
+        STick["NetworkServer.OnTick\nFixed Tick Clock"]
+        SSim["Authoritative Simulation\nApply Inputs & Broadcast State"]
+        STick --> SSim
+    end
+
+    CReconcile -- "1. Tick Input" --> Ch0 --> SSim
+    SSim -- "2. Authoritative Snapshot" --> Ch1 --> CReconcile & CInterp
+    SSim -- "3. Discrete Game Events" --> Ch2 --> Client
+    CClock <-- "4. Handshake & Clock Probes" --> Ch3 <-- "Welcome / Sync" --> Server
 ```
 
-## Quick start
+---
+
+## Quick Start
+
+### 1. Define and Register a Game Message
+
+Game messages claim a stable wire byte in `16..255` (`1..15` are reserved for built-in protocol messages) and serialize fields explicitly in matching order:
 
 ```csharp
 using Krut.Netcode;
 using LiteNetLib.Utils;
 
-// A game message: a stable wire byte in 16-255, hand-written Write/Read.
-public sealed class InputMessage : INetworkMessage
+public sealed class CarInputMessage : INetworkMessage
 {
+    public const byte Wire = 16;
+
     public NetworkMessageType Type => NetworkMessageType.None;
-    public byte WireType => 16;
+    public byte WireType => Wire;
     public NetworkDelivery Delivery => NetworkDelivery.Unreliable;
-    public int Tick; public float Throttle;
-    public void Write(NetDataWriter w) { w.Put(Tick); w.Put(Throttle); }
-    public void Read(NetDataReader r)  { Tick = r.GetInt(); Throttle = r.GetFloat(); }
+    public byte Channel => NetworkChannels.Input;
+
+    public int Tick;
+    public float Throttle;
+    public float Steer;
+
+    public void Reset()
+    {
+        Tick = 0;
+        Throttle = 0f;
+        Steer = 0f;
+    }
+
+    public void Write(NetDataWriter writer)
+    {
+        writer.Put(Tick);
+        writer.Put(Throttle);
+        writer.Put(Steer);
+    }
+
+    public void Read(NetDataReader reader)
+    {
+        Tick = reader.GetInt();
+        Throttle = reader.GetFloat();
+        Steer = reader.GetFloat();
+    }
 }
 
-NetworkMessages.RegisterGameMessage<InputMessage>(16, NetworkDelivery.Unreliable);
+// Register once at startup (shared across sessions in the same process):
+NetworkMessages.RegisterGameMessage<CarInputMessage>(CarInputMessage.Wire, NetworkDelivery.Unreliable);
+```
 
-var config = new NetworkConfig { Port = 25555, TickRate = 60 };   // tick rate = physics step
+### 2. Run the Server and Client Loop
 
-// Server
-var server = new NetworkServer(config);
-server.MessageReceived += env => { if (env.Message is InputMessage m) { /* apply m for env.PeerId */ } };
-if (!server.Start()) return;
+```csharp
+var config = new NetworkConfig
+{
+    ApplicationId = "my.game",
+    ProtocolVersion = 1,
+    Port = 25555,
+    TickRate = 60, // Match your fixed physics timestep
+    MaxClients = 16,
+};
 
-// Client
-var client = new NetworkClient(config);
-client.SessionReady += () => Console.WriteLine("connected");
-client.Closed += (reason, text) => Console.WriteLine($"closed: {text}");
-client.Connect("127.0.0.1", config.Port, "Alice");
+using var server = new NetworkServer(config);
+server.MessageReceived += envelope =>
+{
+    if (envelope.Is<CarInputMessage>(out var input))
+    {
+        // Apply input for envelope.PeerId; envelope.Message is recycled when this handler returns.
+    }
+};
+server.Start();
 
-// Both sides, every frame. Update is the only mandatory call.
-while (true)
+using var client = new NetworkClient(config);
+client.SessionReady += () => Console.WriteLine($"Ready as peer #{client.LocalPeerId} @ {client.Config.TickRate} Hz");
+client.Closed += (reason, text) => Console.WriteLine($"Disconnected ({reason}): {text}");
+client.Connect("127.0.0.1", config.Port, playerName: "Alice");
+
+// Main loop: call Update(dt) once per frame
+while (running)
 {
     server.Update(dt);
     client.Update(dt);
 
     if (client.IsSessionReady)
     {
-        var msg = NetworkSession.Rent<InputMessage>();
-        msg.Tick = client.CurrentTick; msg.Throttle = 1f;
-        client.Send(client.ServerPeerId, msg);   // msg is pooled: do not touch it after Send
+        var msg = NetworkSession.Rent<CarInputMessage>();
+        msg.Tick = client.CurrentTick;
+        msg.Throttle = 1.0f;
+        msg.Steer = -0.25f;
+        client.Send(client.ServerPeerId, msg); // Automatically recycled after Send
     }
 }
 ```
 
-The guide covers prediction and interpolation wiring (`NetworkReconciler<TState, TInput>`,
-`NetworkSnapshotInterpolator<TState>`, `NetworkTimeSync`) in sections 5 and 6.
+---
 
-## Demo
+## Client Prediction & Interpolation
 
-One process, headless: a server and two clients over localhost UDP, a simulated 100 ms RTT / 2 % loss link, scripted input, 10 s of play.
+The lag-compensation primitives in `Prediction/` and `Time/` are completely decoupled from sockets and sessions. They operate over any `unmanaged` state/input structs with zero per-frame allocations:
 
+```csharp
+// 1. Local entity: predict immediately, rewind & replay unacknowledged inputs on server snapshot
+var reconciler = new NetworkReconciler<UnitState, UnitInput>(VisualSmoothingSettings.Default)
+{
+    Step = UnitSim.Step,          // Pure function: (state, tick, input) -> nextState
+    DistanceMetric = UnitSim.Distance,
+};
+
+// Each client tick:
+UnitState predicted = reconciler.Predict(client.CurrentTick, localInput);
+
+// When an authoritative snapshot arrives from the server:
+if (reconciler.SetAuthoritativeState(snapshot.ServerTick, snapshot.OwnState))
+{
+    reconciler.Reconcile(snapshot.ServerTick, snapshot.LastProcessedInputTick,
+        static (authState, ackTick, inputs, count) =>
+        {
+            var s = authState;
+            for (int i = 0; i < count; i++)
+                s = UnitSim.Step(s, ackTick + 1 + i, inputs[i]);
+            return s;
+        });
+}
+
+// Each render frame: advance visual error decay and render SmoothedState
+reconciler.UpdateRenderState(frameDeltaSeconds);
+RenderLocalUnit(reconciler.SmoothedState);
+
+// 2. Remote entities: buffer snapshots and sample DelayTicks in the past
+var interpolator = new NetworkSnapshotInterpolator<UnitState>(delayTicks: 3);
+interpolator.Push(snapshot.ServerTick, snapshot.RemoteState);
+
+double renderTick = client.CurrentTick + client.TickProgress - interpolator.DelayTicks;
+if (interpolator.TrySampleTime(renderTick, out UnitState remoteState, out NetworkSampleMode mode))
+{
+    RenderRemoteUnit(remoteState);
+}
 ```
-dotnet run --project samples/PredictionDemo -c Release
-# other links: --profile stress|bad|lan|clean  --seconds 20
+
+---
+
+## Network Link Simulator
+
+Because LiteNetLib strips its internal debug simulator from Release NuGet builds, **Krut.Netcode** ships a deterministic, seeded link simulator that works in **all** build configurations. Configure it in code or via environment variables:
+
+```bash
+# Apply a named profile ("clean", "lan", "gate", "stress", "bad", "blackout", "thin")
+export KRUT_NET_PROFILE=gate
+export KRUT_NET_SEED=42
+```
+
+| Environment Variable | Description |
+| :--- | :--- |
+| `KRUT_NET_PROFILE` | Named preset in round-trip terms: `clean` (0 ms), `lan` (2 ms), `gate` (100 ms, 2% loss), `stress` (180 ms, 2% loss), `bad` (250 ms, 5% burst loss, reorder & dup), `blackout` (scheduled outages), `thin` (64 kbit/s downlink cap). |
+| `KRUT_NET_LAG_MS` | Round-trip latency in ms (split equally per direction when resolved by side). |
+| `KRUT_NET_JITTER_MS` | Round-trip latency variation ($\pm$ ms). |
+| `KRUT_NET_LOSS` | Packet drop probability (`0.0` to `1.0`). |
+| `KRUT_NET_BURST` | Mean burst loss length in messages (Gilbert–Elliott 2-state Markov model). |
+| `KRUT_NET_REORDER` / `KRUT_NET_DUP` | Message reorder probability and duplication probability (`0.0` to `1.0`). |
+| `KRUT_NET_BW_KBIT` | Token-bucket server downlink bandwidth cap in kbit/s with tail-drop queue. |
+| `KRUT_NET_OUTAGES` | Comma-separated `start:duration` blackout windows in seconds (e.g. `15:1,30:5`). |
+| `KRUT_NET_DATAGRAM` | `1` or `true` moves loss, bursts, and outages to the raw LiteNetLib UDP datagram layer (`NetworkDatagramSimLayer`). |
+
+---
+
+## Headless Prediction Demo
+
+Run the self-contained headless verification harness (`samples/PredictionDemo`) simulating a server and two clients over localhost UDP with a degraded link:
+
+```bash
+dotnet run --project samples/PredictionDemo -c Release -- --profile gate --seconds 10
 ```
 
 ```text
@@ -107,106 +269,60 @@ error vs server, no reconcile: mean (mm)            16.4        11.1
 error vs server, no reconcile: max (mm)             30.4        18.0
 error vs server, reconciled: mean (mm)               0.1         0.1
 error vs server, reconciled: max (mm)                1.4         2.3
-error at ack, before reconcile: mean (mm)            0.1         0.1
-error at ack, before reconcile: max (mm)             1.1         2.0
-correction applied per snapshot: mean (mm)           0.0         0.0
 
 snapshots reconciled (rollbacks)                     299         290
 inputs replayed, total / per rollback             2808/9     3048/10
 rollback misses / ignored snapshots                  0/0         0/0
 
-remote unit samples: Exact                           298         289
-remote unit samples: Interpolated                    303         297
-remote unit samples: Extrapolated                      0           0
-remote unit samples: Held                              0           0
-remote unit error vs server: mean (mm)               1.2         1.2
-remote unit error vs server: max (mm)               12.2        11.8
-remote view delay (ms)                               200         200
-
-bytes/s sent (client)                                973         947
-bytes/s received (client)                           1404        1400
-server bytes/s sent / received                      2804        1920
-play time (s)                                       10.0
-
 PASS: prediction stays close to the server, replay corrects the rest.
 ```
 
-Without reconciliation the client drifts from the server by tens of millimetres after a lost input; with it the error stays near zero. The measured RTT is above the configured 100 ms because both clients and the server share one polling loop. Exit code 0 on PASS, 1 on failure.
-
-## Repository layout
-
-```
-src/Krut.Netcode/      the library (namespace Krut.Netcode)
-  Session/             server, client, session base, config, peers, errors
-  Messages/            message contract, built-in messages, codec, channels
-  Time/                tick clock, time sync
-  Prediction/          state ring, snapshot interpolator, reconciler
-  Simulation/          link simulator, profiles, delay queue, datagram stage
-  Diagnostics/         statistics and datagram probe
-tests/Krut.Netcode.Tests/   xunit tests
-benchmarks/Krut.Netcode.Benchmarks/   allocation and throughput benchmarks
-samples/PredictionDemo/     headless server + 2 clients demo
-docs/                  guide, architecture, diagrams, roadmap
-.github/                CI and release workflows, issue and PR templates
-CHANGELOG.md, SECURITY.md, CODE_OF_CONDUCT.md, CONTRIBUTING.md
-```
-
-## Documentation
-
-- [docs/guide.md](docs/guide.md): usage, configuration, messages, lag primitives, simulator, troubleshooting, releasing
-- [docs/architecture.md](docs/architecture.md): code map, frame loop, wire format, handshake, invariants
-- [docs/diagrams.md](docs/diagrams.md) and [docs/architecture.drawio](docs/architecture.drawio): Mermaid and editable diagrams
-- [CONTRIBUTING.md](CONTRIBUTING.md): build, test, style, pull request checklist
-- [docs/roadmap.md](docs/roadmap.md): known limitations and next steps
-- [CHANGELOG.md](CHANGELOG.md), [SECURITY.md](SECURITY.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+---
 
 ## Benchmarks
 
-`benchmarks/Krut.Netcode.Benchmarks` (BenchmarkDotNet) measures the hot paths and their allocations:
+Measured with [BenchmarkDotNet](https://benchmarkdotnet.org/) on .NET 9 (`benchmarks/Krut.Netcode.Benchmarks`):
 
-```
+```bash
 dotnet run -c Release --project benchmarks/Krut.Netcode.Benchmarks -- --filter "*"
 ```
 
-Indicative numbers from one short, noisy run (`--job short`, Windows 11, .NET 9): codec write
-position + rotation 29 ns and read 23 ns; reconcile predict + replay of 6 / 18 / 60 inputs 277 ns /
-866 ns / 3.2 us; interpolator sample 28 ns; all with 0 B allocated. Treat them as a sanity check,
-not a published benchmark.
+| Benchmark | Mean Time | Allocated |
+| :--- | ---: | ---: |
+| `CodecBenchmarks.WritePositionAndRotation` | ~29 ns | `0 B` |
+| `CodecBenchmarks.ReadPositionAndRotation` | ~23 ns | `0 B` |
+| `MessagePoolBenchmarks.RentWriteReadRecycle` | ~38 ns | `0 B` |
+| `InterpolatorBenchmarks.SampleOnly` | ~28 ns | `0 B` |
+| `ReconcilerBenchmarks.PredictAndReconcile` (6 ticks / 100 ms RTT) | ~277 ns | `0 B` |
+| `ReconcilerBenchmarks.PredictAndReconcile` (18 ticks / 300 ms RTT) | ~866 ns | `0 B` |
 
-## Testing
+---
 
+## Repository Layout & Documentation
+
+```text
+Krut.Netcode/
+├── src/Krut.Netcode/                  # Core library (net9.0, IsAotCompatible)
+│   ├── Session/                       # NetworkSession, NetworkServer, NetworkClient, NetworkConfig
+│   ├── Messages/                      # INetworkMessage, NetworkMessages, NetworkCodec, NetworkProtocol
+│   ├── Time/                          # NetworkClock, NetworkTimeSync
+│   ├── Prediction/                    # NetworkReconciler, NetworkSnapshotInterpolator, NetworkStateRing
+│   ├── Simulation/                    # NetworkSimulation, NetworkLinkModel, NetworkDelayQueue, Datagram layers
+│   └── Diagnostics/                   # NetworkStatistics, NetDatagramProbe
+├── tests/Krut.Netcode.Tests/          # xUnit test suite (handshake, codec, zero-alloc, security, simulator)
+├── benchmarks/Krut.Netcode.Benchmarks/# BenchmarkDotNet throughput & memory benchmarks
+├── samples/PredictionDemo/            # Headless server + 2 clients verification harness
+└── docs/                              # In-depth user guide, maintainer architecture & Mermaid diagrams
 ```
-dotnet test
-```
 
-The suite is xunit and covers the handshake and rejection paths, the tick clock, the codec, message
-pooling and per-packet allocation, time sync, extrapolation, reconnects and the link simulator.
+- **[User Guide (`docs/guide.md`)](docs/guide.md)** — Configuration, message contracts, channels, prediction/interpolation setup, troubleshooting, and release workflow.
+- **[Architecture (`docs/architecture.md`)](docs/architecture.md)** — Frame execution order, threading model, wire layout, and core invariants.
+- **[Diagrams (`docs/diagrams.md`)](docs/diagrams.md)** — Mermaid sequence and component diagrams (with editable source in [`docs/architecture.drawio`](docs/architecture.drawio)).
+- **[Roadmap (`docs/roadmap.md`)](docs/roadmap.md)** — Known design trade-offs and planned enhancements.
+- **[Contributing (`CONTRIBUTING.md`)](CONTRIBUTING.md)** & **[Security Policy (`SECURITY.md`)](SECURITY.md)**.
 
-## Design notes
-
-**Hand-written serialization.** Every message writes and reads its own fields through
-`NetDataWriter`/`NetDataReader`. There is no reflection (so Native AOT works), the packet size is
-exactly what `Write` puts out, and an unknown type byte is counted and skipped rather than
-disconnecting an older client. The cost is that `Write` and `Read` must list fields in the same
-order; the troubleshooting table in the guide shows how a mismatch surfaces.
-
-**Median time sync.** The client estimates the server tick from request/response samples. A mean
-lets a single delayed packet move the estimate for good, and a high RTT sample mostly measures a
-queue. The offset is the median over the last 16 samples after dropping any sample whose RTT is
-more than 2x the best. `NaiveAverageOffsetTicks` stays only so tests can show the difference.
-
-**Tick rate equals the physics step.** Reconciliation replays stored inputs and expects the same
-result the server got. If one tick spans a different number of physics steps on either side, each
-rollback adds a new error instead of removing one.
-
-More detail: [docs/guide.md](docs/guide.md).
-
-## Origin
-
-Extracted from the engine of Krut.Racing, an in-development multiplayer racing game with a
-headless authoritative dedicated server. The library has no game-specific code; the game owns its
-messages, snapshot format and physics.
+---
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Author: William Eklund.
+Licensed under the [MIT License](LICENSE). Copyright © 2026 William Eklund.

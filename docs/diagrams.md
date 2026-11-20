@@ -324,11 +324,11 @@ The connection request carries a raw payload that is not a message: `string Appl
 
 ### Channels
 
-`NetManager.ChannelsCount` is `NetworkChannels.Count` (4). `NetworkChannels.For` only ever returns channel 1 or 2, so channels 0 and 3 are reserved constants today. Delayed sends from `NetworkDelayQueue` use the same channel and method.
+`NetManager.ChannelsCount` is `NetworkChannels.Count` (4). `NetworkChannels.For` defaults to channel 1 (`Snapshot`) or 2 (`Events`), while `INetworkMessage.Channel` can override the target channel (e.g. `WelcomeMessage` uses channel 3 `Control`, and input messages can use channel 0 `Input`). Delayed sends from `NetworkDelayQueue` use the same channel and method.
 
 | Channel | Name | `NetworkDelivery` routed here | LiteNetLib `DeliveryMethod` | Used for |
 |---|---|---|---|---|
-| 0 | Input | none (constant only) | - | reserved |
-| 1 | Snapshot | Unreliable | Unreliable | every unreliable message (input, snapshots, time sync in the sample) |
-| 2 | Events | ReliableOrdered, ReliableUnordered | ReliableOrdered / ReliableUnordered | built-in messages and reliable game messages |
-| 3 | Control | none (constant only) | - | reserved |
+| 0 | Input | via `INetworkMessage.Channel` | Unreliable | high-frequency client input per tick |
+| 1 | Snapshot | Unreliable (default) | Unreliable | server snapshots and default unreliable messages |
+| 2 | Events | ReliableOrdered, ReliableUnordered (default) | ReliableOrdered / ReliableUnordered | built-in messages and reliable game messages |
+| 3 | Control | via `INetworkMessage.Channel` | ReliableOrdered | `WelcomeMessage`, handshake, clock sync |

@@ -9,7 +9,7 @@ GitHub) and [architecture.drawio](architecture.drawio) (editable in diagrams.net
 Diagram: [Overview](diagrams.md#overview).
 
 Everything lives in `src/Krut.Netcode` (namespace `Krut.Netcode` throughout; folders are for
-navigation only). Dependencies: LiteNetLib 2.1.4 and `System.Numerics`.
+navigation only). Dependencies: LiteNetLib 2.1.5 and `System.Numerics`.
 
 **`Session/`: transport and session**
 
@@ -120,11 +120,12 @@ byte 1..n     the message body, exactly what INetworkMessage.Write put out
 | 5-15 | Reserved for future built-in messages |
 | 16-255 | Game messages, registered with `NetworkMessages.RegisterGameMessage<T>` |
 
-The channel and delivery method come from the message's `Delivery`:
+The channel and delivery method come from the message's `Delivery` and `Channel`:
 `NetworkChannels.For(delivery)` picks channel 1 (`Snapshot`) for `Unreliable` and channel 2
-(`Events`) for everything reliable; `NetworkChannels.ToDeliveryMethod` maps to LiteNetLib. Channels
-0 (`Input`) and 3 (`Control`) exist but are not selected automatically. A packet that does not fit
-the MTU on an unreliable channel is reported as `PacketTooLarge`.
+(`Events`) for everything reliable by default, while `INetworkMessage.Channel` lets messages route
+to channel 0 (`Input`) or channel 3 (`Control`, used by `WelcomeMessage`).
+`NetworkChannels.ToDeliveryMethod` maps to LiteNetLib. A packet that does not fit the MTU on an
+unreliable channel is reported as `PacketTooLarge`.
 
 The connection request carries a separate raw payload written by `NetworkClient.Connect`, read by
 `NetworkServer.HandleConnectionRequest` before any session state exists:
@@ -171,8 +172,8 @@ client                                   server
   connection request + payload  ------>  HandleConnectionRequest
                                            ApplicationId differs -> silent reject
                                            ProtocolVersion differs -> reject + reason
-                                           lobby full -> reject + reason (only when no ConnectionApproval is set)
                                            ConnectionApproval refuses -> reject + reason
+                                           lobby full -> reject + reason
                                          accept
                                 <------  OnPeerConnected: Welcome (reliable), then PlayerInfo rows
   Welcome: set peer id, name,

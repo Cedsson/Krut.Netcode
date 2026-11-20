@@ -5,7 +5,7 @@ the source (`src/Krut.Netcode`) for member lists; every type named here exists t
 
 ## 1. Scope
 
-Provided: UDP transport on LiteNetLib 2.1.4 (reliable/unreliable, sequencing), `NetworkServer` /
+Provided: UDP transport on LiteNetLib 2.1.5 (reliable/unreliable, sequencing), `NetworkServer` /
 `NetworkClient` with a handshake (app id, protocol version, name), rejection with a reason and
 library-level reconnect, a hand-written pooled message system, four channels, a fixed tick clock,
 client lag primitives (time sync, snapshot interpolation, reconciliation), a link simulator and
@@ -27,7 +27,7 @@ overrides the `protected virtual OnTick()` to run once per whole tick.
   (`UnknownMessageCount`, `MalformedMessageCount`, `DroppedPacketCount`). Events:
   `PeerConnected`, `PeerDisconnected`, `MessageReceived`, `Error`.
 - **`NetworkServer`**: `Start()` (false if the port cannot be bound), `Stop()`,
-  `ConnectionApproval` (set before `Start`), `DisconnectPeer`, `DisconnectAll`. Enforces `MaxClients` (only when no `ConnectionApproval` is set; with one, the callback decides).
+  `ConnectionApproval` (set before `Start`), `DisconnectPeer`, `DisconnectAll`. Always enforces `MaxClients` (after `ConnectionApproval` if one is set).
 - **`NetworkClient`**: `Connect(address, port, name)`, `Disconnect`, `Stop`, `SetPlayerName`,
   `State` (`Offline`/`Connecting`/`Connected`/`Reconnecting`), `IsSessionReady`, events
   `SessionReady`, `Closed`. The connection is up long before `Welcome` arrives: replicate only
@@ -128,8 +128,9 @@ Outgoing packets reuse one `NetDataWriter`; steady state allocates nothing per p
 | `Control` | 3 | Reliable | handshake, clock sync, kick |
 
 One LiteNetLib queue each, so a lost input packet never waits behind an event.
-`NetworkChannels.For(delivery)` currently routes everything unreliable to `Snapshot` and everything
-reliable to `Events`; `Input` and `Control` have no automatic routing.
+`NetworkChannels.For(delivery)` routes unreliable messages to `Snapshot` and reliable messages to
+`Events` by default; override `INetworkMessage.Channel` to route high-frequency inputs to `Input`
+or control traffic to `Control` (`WelcomeMessage` uses `Control`).
 
 Choose `Delivery` per message by what it represents: state of this tick -> `Unreliable` (a late
 packet is worthless, the next replaces it); something that must arrive -> `ReliableOrdered`;
@@ -259,7 +260,7 @@ state, same build on server and client. Bit-exact is not required for reconcilia
 get corrected) but fewer divergences mean fewer visible corrections. The library has no state hash,
 snapshot format or delta encoding; the game owns those.
 
-Dependency: LiteNetLib 2.1.4 (MIT); only the AOT-safe core (`NetDataWriter`/`NetDataReader`) is
+Dependency: LiteNetLib 2.1.5 (MIT); only the AOT-safe core (`NetDataWriter`/`NetDataReader`) is
 used, never the reflection-based `NetSerializer`.
 
 ## Releasing
