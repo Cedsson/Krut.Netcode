@@ -320,12 +320,17 @@ namespace Krut.Netcode
         /// </param>
         public bool ShouldProbe(int clientTick)
         {
-            // A request is already out in the network: sending another adds nothing, because the response to
-            // the first one can't arrive any earlier anyway.
-            if (_pendingCount > 0)
-                return false;
-
+            // Wait until the newest unanswered request is at least one probe interval old so a lost UDP packet
+            // does not stall probing permanently.
             int interval = IsSynchronized ? RecommendedProbeIntervalTicks : FirstSyncProbeIntervalTicks;
+            if (_pendingCount > 0)
+            {
+                int latestIndex = (_pendingHead + _pendingCount - 1) % SampleCapacity;
+                int latestPendingTick = _pendingTicks[latestIndex];
+                if (clientTick >= latestPendingTick && clientTick - latestPendingTick < interval)
+                    return false;
+            }
+
             return clientTick % interval == 0;
         }
 
@@ -399,7 +404,7 @@ namespace Krut.Netcode
                 return;
 
             _roundTrip[_nextSample] = roundTripSeconds;
-            _offsets[_nextSample] = serverTick - clientTickAtSend - roundTripSeconds * TickRate * 0.5;
+            _offsets[_nextSample] = (double)serverTick - clientTickAtSend - roundTripSeconds * TickRate * 0.5;
             _nextSample = (_nextSample + 1) % SampleCapacity;
             if (_sampleCount < SampleCapacity)
                 _sampleCount++;

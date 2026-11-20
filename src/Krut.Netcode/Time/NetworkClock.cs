@@ -34,7 +34,13 @@ namespace Krut.Netcode
         }
 
         /// <summary>Ticks per second.</summary>
-        public int TickRate { get; }
+        public int TickRate { get; private set; }
+
+        /// <summary>Updates the tick rate (clamped to 1..240 Hz), e.g. when adopting the server's tick rate.</summary>
+        public void SetTickRate(int tickRate)
+        {
+            TickRate = Math.Clamp(tickRate, 1, 240);
+        }
 
         /// <summary>Seconds per tick - how far the clock is moved in <see cref="Advance"/> per tick.</summary>
         public float TickInterval => 1f / TickRate;
