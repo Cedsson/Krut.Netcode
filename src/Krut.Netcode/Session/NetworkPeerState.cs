@@ -90,6 +90,14 @@ namespace Krut.Netcode
         /// </summary>
         public int ReliableQueueLength => Peer.GetPacketsCountInReliableQueue(false);
 
+        /// <summary>Number of inbound packets from this peer dropped or evicted due to overload limits.</summary>
+        public long DroppedInboundEvents { get; internal set; }
+
+        internal int InboundPollEpoch { get; set; } = -1;
+        internal int InboundEventsInPoll { get; set; }
+        internal int InboundUnreliableInPoll { get; set; }
+        internal int InboundEvictCursor { get; set; }
+
         /// <summary>The underlying LiteNetLib peer. Internal: game logic goes through this wrapper.</summary>
         internal NetPeer Peer { get; }
 

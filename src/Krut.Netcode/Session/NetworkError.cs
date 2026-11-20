@@ -28,6 +28,12 @@ namespace Krut.Netcode
 
         /// <summary>The server could not listen on the port (taken, not permitted).</summary>
         StartFailed,
+
+        /// <summary>An application event callback threw an unhandled exception during event draining.</summary>
+        CallbackException,
+
+        /// <summary>An inbound event queue, byte budget, packet-size, or per-peer burst limit was exceeded and traffic was dropped.</summary>
+        InboundOverload,
     }
 
     /// <summary>A network error to show/log - the library never throws exceptions at the game logic for network problems.</summary>

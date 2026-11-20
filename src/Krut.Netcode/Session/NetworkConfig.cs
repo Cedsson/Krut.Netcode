@@ -145,6 +145,41 @@ namespace Krut.Netcode
         /// </summary>
         public int MaxCatchUpTicks { get; set; } = 5;
 
+        /// <summary>
+        /// Maximum number of queued inbound payload/socket events held in the pending queue before
+        /// unreliable/unconnected packets are evicted or excess traffic is dropped. Minimum 1.
+        /// </summary>
+        public int MaxPendingEvents { get; set; } = 4096;
+
+        /// <summary>
+        /// Maximum total payload bytes held across queued inbound packets before unreliable/unconnected packets are
+        /// evicted or excess traffic is dropped. Minimum 1.
+        /// </summary>
+        public int MaxPendingEventBytes { get; set; } = 4 * 1024 * 1024;
+
+        /// <summary>
+        /// Maximum allowed byte size for a single received connected packet. Packets exceeding this limit are
+        /// dropped before renting a receive buffer. Minimum 1.
+        /// </summary>
+        public int MaxReceivedPacketBytes { get; set; } = 64 * 1024;
+
+        /// <summary>
+        /// Maximum number of inbound packets accepted from a single peer during one poll cycle before its
+        /// unreliable packets are evicted or further packets from that peer are dropped. Minimum 1.
+        /// </summary>
+        public int MaxEventsPerPeerPerPoll { get; set; } = 256;
+
+        /// <summary>
+        /// Maximum number of unconnected datagrams accepted during one poll cycle. Minimum 1.
+        /// </summary>
+        public int MaxUnconnectedEventsPerPoll { get; set; } = 64;
+
+        /// <summary>
+        /// Maximum number of inbound events dispatched during a single <see cref="NetworkSession.Update"/> drain.
+        /// Set to <c>0</c> (the default) to drain the entire batch every frame; negative values reset to <c>0</c>.
+        /// </summary>
+        public int MaxEventsPerDrain { get; set; }
+
         /// <summary>Clamps the values to valid intervals.</summary>
         public void Validate()
         {
@@ -172,6 +207,18 @@ namespace Krut.Netcode
                 ConnectRequestAttempts = 1;
             if (MaxCatchUpTicks < 1)
                 MaxCatchUpTicks = 1;
+            if (MaxPendingEvents < 1)
+                MaxPendingEvents = 1;
+            if (MaxPendingEventBytes < 1)
+                MaxPendingEventBytes = 1;
+            if (MaxReceivedPacketBytes < 1)
+                MaxReceivedPacketBytes = 1;
+            if (MaxEventsPerPeerPerPoll < 1)
+                MaxEventsPerPeerPerPoll = 1;
+            if (MaxUnconnectedEventsPerPoll < 1)
+                MaxUnconnectedEventsPerPoll = 1;
+            if (MaxEventsPerDrain < 0)
+                MaxEventsPerDrain = 0;
         }
 
         /// <summary>Seconds per tick - the session's clock is stepped by this, not by the frame.</summary>

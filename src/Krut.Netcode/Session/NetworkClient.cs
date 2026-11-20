@@ -139,6 +139,7 @@ namespace Krut.Netcode
             }
             catch (Exception)
             {
+                StopListener();
                 Report(new NetworkError(NetworkErrorCode.StartFailed, $"Invalid address: {_address}."));
                 _state = NetworkClientState.Offline;
                 return false;
@@ -153,6 +154,7 @@ namespace Krut.Netcode
 
             if (ConnectTo(endPoint, payload.Data.AsSpan(0, payload.Length)) is null)
             {
+                StopListener();
                 Report(new NetworkError(NetworkErrorCode.NotConnected, $"Could not send the connection request to {_address}:{_port}."));
                 _state = NetworkClientState.Offline;
                 return false;
@@ -230,12 +232,24 @@ namespace Krut.Netcode
 
             _reconnectTimer = 0f;
             int attempts = _attempts + 1;
-            // The lost connection leaves the socket running, and Connect refuses to dial on a running session.
+            // Ensure socket is closed before dialing a fresh attempt.
             StopListener();
             SetRunning(false);
-            Connect(_address, _port, localPort: _localPort);
+            bool started = Connect(_address, _port, localPort: _localPort);
             // Connect resets the counter for a fresh dial; a retry keeps counting the same outage.
             _attempts = attempts;
+            if (!started)
+            {
+                if (_attempts >= Config.MaxConnectAttempts)
+                {
+                    _state = NetworkClientState.Offline;
+                    Report(new NetworkError(NetworkErrorCode.NotConnected, $"Gave up reconnecting to {_address}:{_port} after {_attempts} attempts."));
+                }
+                else
+                {
+                    _state = NetworkClientState.Reconnecting;
+                }
+            }
         }
 
         /// <summary>
@@ -306,6 +320,11 @@ namespace Krut.Netcode
             _state = reason == DisconnectReason.ConnectionRejected || !Config.AutoReconnect || givenUp
                 ? NetworkClientState.Offline
                 : NetworkClientState.Reconnecting;
+
+            // Stop the underlying socket and mark IsRunning false before firing Closed so callers and
+            // handlers observe an inactive transport and can immediately call Connect() without manual Stop().
+            StopListener();
+            SetRunning(false);
 
             if (givenUp && Config.AutoReconnect && reason != DisconnectReason.ConnectionRejected)
                 Report(new NetworkError(NetworkErrorCode.NotConnected, $"Gave up reconnecting to {_address}:{_port} after {_attempts} attempts."));

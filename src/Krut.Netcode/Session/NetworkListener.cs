@@ -48,7 +48,7 @@ namespace Krut.Netcode
         /// <inheritdoc/>
         public void OnNetworkError(IPEndPoint endPoint, SocketError error)
         {
-            Pending.Add(NetworkEvent.Socket(endPoint, error));
+            _session.EnqueueSocketError(endPoint, error);
         }
 
         /// <inheritdoc/>
@@ -125,6 +125,9 @@ namespace Krut.Netcode
 
         public static NetworkEvent Socket(IPEndPoint endPoint, SocketError error)
             => new() { Kind = NetworkEventKind.SocketError, EndPoint = endPoint, Error = error };
+
+        public static NetworkEvent Dropped()
+            => new() { Kind = NetworkEventKind.Dropped };
     }
 
     /// <summary>
@@ -139,5 +142,6 @@ namespace Krut.Netcode
         Received,
         Unconnected,
         SocketError,
+        Dropped,
     }
 }

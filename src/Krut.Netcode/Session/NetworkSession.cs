@@ -1,6 +1,8 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Net.Sockets;
 using LiteNetLib;
 using LiteNetLib.Utils;
 
@@ -38,6 +40,9 @@ namespace Krut.Netcode
         /// <summary>Reused for sending - no allocations per packet (see <see cref="SendInternal"/>). The parameter is the initial size.</summary>
         private readonly NetDataWriter _writer = new(true, 256);
 
+        private bool _writerInUse;
+        private bool _inUpdate;
+
         /// <summary>
         /// Keyed by peer id, not by peer object: a message handler routinely wants to find a peer from an id in
         /// an incoming payload, and the id is what a game puts in its own messages (see
@@ -61,6 +66,9 @@ namespace Krut.Netcode
         /// <summary>Cached so that <see cref="Update"/> does not create a delegate per frame.</summary>
         private readonly Action _onTick;
 
+        /// <summary>Cached so that <see cref="Update"/> does not allocate a delegate for <see cref="NetworkDelayQueue.FlushDue"/>.</summary>
+        private readonly Action<NetworkError> _reportSafely;
+
         private bool _disposed;
 
         /// <summary>
@@ -81,15 +89,12 @@ namespace Krut.Netcode
             _clock = new NetworkClock(Config.TickRate, Config.MaxCatchUpTicks);
             _listener = new NetworkListener(this);
             _onTick = OnTick;
+            _reportSafely = ReportSafely;
 
-            // The second parameter to NetManager is an extra layer on top of UDP (encryption/checksum). null =
-            // plain UDP, i.e. LiteNetLib's own (sequence, acks) is enough - encryption is not the library's job.
             DatagramChain = Config.DatagramLayer ?? NetworkDatagramChain.DefaultFactory?.Invoke();
             _manager = new NetManager(_listener, DatagramChain!);
             _manager.ChannelsCount = NetworkChannels.Count;
-            // IPv6 is not controlled through an instance property in LiteNetLib 2.x but through which address
-            // you bind in StartListener (null = dual-stack, see StartListener(string?, int)), so
-            // Config.IPv6Support is applied there instead of here.
+            _manager.IPv6Enabled = Config.IPv6Support;
             _manager.EnableStatistics = Config.EnableStatistics;
             _manager.MtuDiscovery = Config.MtuDiscovery;
             if (Config.MtuOverride > 0)
@@ -177,6 +182,30 @@ namespace Krut.Netcode
         /// <summary>Number of messages that could not be decoded (too short a packet, broken header).</summary>
         public int MalformedMessageCount { get; private set; }
 
+        /// <summary>Number of inbound payload events currently queued for draining.</summary>
+        public int PendingEventCount => _pendingPayloadEventCount;
+
+        /// <summary>Peak number of queued inbound payload events observed in this session.</summary>
+        public int PeakPendingEventCount { get; private set; }
+
+        /// <summary>Total payload bytes currently held in queued inbound packets.</summary>
+        public long PendingEventBytes => _pendingEventBytes;
+
+        /// <summary>Peak queued inbound payload bytes observed in this session.</summary>
+        public long PeakPendingEventBytes { get; private set; }
+
+        /// <summary>Number of inbound events dropped or evicted due to queue, byte, packet-size, or per-peer burst limits.</summary>
+        public long DroppedInboundEventCount { get; private set; }
+
+        /// <summary>Total payload bytes of inbound events dropped or evicted due to overload limits.</summary>
+        public long DroppedInboundBytes { get; private set; }
+
+        /// <summary>Number of unhandled exceptions caught from application callbacks during event draining.</summary>
+        public long CallbackExceptionCount { get; private set; }
+
+        /// <summary>Number of events dispatched in the most recent <see cref="Update"/> drain.</summary>
+        public int LastDrainedEventCount { get; private set; }
+
         /// <summary>Number of whole ticks released during the most recent <see cref="Update"/>.</summary>
         public int LastReleasedTickCount => _clock.LastReleasedTickCount;
 
@@ -188,6 +217,12 @@ namespace Krut.Netcode
 
         /// <summary>Number of <see cref="Update"/> frames that hit <see cref="NetworkConfig.MaxCatchUpTicks"/>.</summary>
         public long CatchUpClampCount => _clock.CatchUpClampCount;
+
+        /// <summary>Wall-clock duration in milliseconds of the most recent <see cref="Update"/> call.</summary>
+        public double LastUpdateDurationMs { get; private set; }
+
+        /// <summary>Wall-clock duration in milliseconds spent executing fixed ticks in the most recent <see cref="Update"/>.</summary>
+        public double LastTickDurationMs { get; private set; }
 
         /// <summary>Number of packets the simulation has thrown away.</summary>
         public int DroppedPacketCount => _delayQueue.DroppedCount;
@@ -217,20 +252,6 @@ namespace Krut.Netcode
                 throw new InvalidOperationException("The simulation is datagram-level but the session has no datagram chain (NetworkConfig.DatagramLayer or NetworkDatagramChain.DefaultFactory).");
 
             _simulation = simulation;
-
-            // LiteNetLib's own simulation fields are set as well, so that a build with SIMULATE_NETWORK defined
-            // (or a debug-built copy of the library) gets its own simulation on top. In a normal release build
-            // of the package the fields are trimmed away (the methods that read them are
-            // [Conditional("DEBUG")]), which is exactly why the library has its own queue below.
-            int min = Math.Max(0, simulation.LatencyMs - simulation.JitterMs) * 2;
-            int max = Math.Max(0, simulation.LatencyMs + simulation.JitterMs) * 2;
-            _manager.SimulateLatency = simulation.LatencyMs > 0;
-            _manager.SimulationMinLatency = min;
-            _manager.SimulationMaxLatency = max;
-            _manager.SimulatePacketLoss = simulation.LossChance > 0f;
-            // LiteNetLib counts loss in whole percent (1-100), while
-            // NetworkSimulation keeps it as a fraction 0.0-1.0.
-            _manager.SimulationPacketLossChance = (int)MathF.Round(simulation.LossChance * 100f);
         }
 
         /// <summary>Switches off an active simulation.</summary>
@@ -239,13 +260,8 @@ namespace Krut.Netcode
             _simulation = null;
             if (DatagramChain is { } chain)
                 chain.Simulation = null;
-            _manager.SimulateLatency = false;
-            _manager.SimulationMaxLatency = 0;
-            _manager.SimulationMinLatency = 0;
-            _manager.SimulatePacketLoss = false;
-            _manager.SimulationPacketLossChance = 0;
 
-            _delayQueue.SendAll();
+            _delayQueue.SendAll(_reportSafely);
         }
 
         /// <summary>
@@ -266,7 +282,10 @@ namespace Krut.Netcode
         /// <summary>A peer disconnected - the peer object is still readable (name, tag) but must not be reused.</summary>
         public event Action<NetworkPeerState, DisconnectInfo>? PeerDisconnected;
 
-        /// <summary>A message arrived.</summary>
+        /// <summary>
+        /// A message arrived. The pooled <see cref="NetworkEnvelope.Message"/> is reset and recycled as soon as
+        /// all handlers return — copy any values you need to keep and do not retain the message reference.
+        /// </summary>
         public event Action<NetworkEnvelope>? MessageReceived;
 
         /// <summary>Network errors, broken messages and rejected connections are reported here (no logging in the library - the game decides).</summary>
@@ -279,6 +298,13 @@ namespace Krut.Netcode
         private const int PooledPacketBufferCapacity = 256;
         private readonly byte[]?[] _packetBuffers = new byte[]?[PooledPacketBufferCapacity];
         private int _packetBufferCount;
+        private int _pendingPayloadEventCount;
+        private long _pendingEventBytes;
+        private int _pendingEvictCursor;
+        private int _pollEpoch;
+        private int _unconnectedEventsInPoll;
+        private int _unknownPeerEventsInPoll;
+        private int _lastOverloadErrorEpoch = -1;
 
         private byte[] RentPacketBuffer(int length)
         {
@@ -309,16 +335,182 @@ namespace Krut.Netcode
             ArrayPool<byte>.Shared.Return(buffer);
         }
 
+        private void ReportInboundOverloadOnce(string reason, int peerId = -1)
+        {
+            if (_lastOverloadErrorEpoch == _pollEpoch)
+                return;
+
+            _lastOverloadErrorEpoch = _pollEpoch;
+            ReportSafely(new NetworkError(NetworkErrorCode.InboundOverload, reason, peerId));
+        }
+
+        private bool TryEvictOneUnreliableGlobal()
+        {
+            while (_pendingEvictCursor < _pending.Count)
+            {
+                var ev = _pending[_pendingEvictCursor];
+                if (ev.Kind == NetworkEventKind.Unconnected
+                    || (ev.Kind == NetworkEventKind.Received && ev.Delivery == NetworkDelivery.Unreliable))
+                {
+                    EvictPendingAt(_pendingEvictCursor);
+                    _pendingEvictCursor++;
+                    return true;
+                }
+
+                _pendingEvictCursor++;
+            }
+
+            return false;
+        }
+
+        private bool TryEvictOneUnreliableForPeer(NetworkPeerState peerState)
+        {
+            if (peerState.InboundUnreliableInPoll <= 0)
+                return false;
+
+            while (peerState.InboundEvictCursor < _pending.Count)
+            {
+                var ev = _pending[peerState.InboundEvictCursor];
+                if (ev.Kind == NetworkEventKind.Received
+                    && ev.Delivery == NetworkDelivery.Unreliable
+                    && ev.Peer is not null
+                    && ev.Peer.Id == peerState.Id)
+                {
+                    EvictPendingAt(peerState.InboundEvictCursor);
+                    peerState.InboundEvictCursor++;
+                    return true;
+                }
+
+                peerState.InboundEvictCursor++;
+            }
+
+            return false;
+        }
+
+        private void EvictPendingAt(int index)
+        {
+            var ev = _pending[index];
+            _pending[index] = NetworkEvent.Dropped();
+            if (ev.Data is { } data)
+                ReturnPacketBuffer(data);
+
+            if (_pendingPayloadEventCount > 0)
+                _pendingPayloadEventCount--;
+            _pendingEventBytes = Math.Max(0, _pendingEventBytes - ev.Length);
+            DroppedInboundEventCount++;
+            DroppedInboundBytes += ev.Length;
+
+            if (ev.Kind == NetworkEventKind.Unconnected)
+            {
+                if (_unconnectedEventsInPoll > 0)
+                    _unconnectedEventsInPoll--;
+            }
+            else if (ev.Kind == NetworkEventKind.Received && ev.Peer is not null && _peers.TryGetValue(ev.Peer.Id, out var evictedPeer))
+            {
+                evictedPeer.DroppedInboundEvents++;
+                if (evictedPeer.InboundPollEpoch == _pollEpoch)
+                {
+                    if (evictedPeer.InboundEventsInPoll > 0)
+                        evictedPeer.InboundEventsInPoll--;
+                    if (ev.Delivery == NetworkDelivery.Unreliable && evictedPeer.InboundUnreliableInPoll > 0)
+                        evictedPeer.InboundUnreliableInPoll--;
+                }
+            }
+        }
+
         /// <summary>
-        /// Called by <see cref="NetworkListener"/> for every received packet: copies the bytes into a pooled
-        /// buffer (LiteNetLib reuses its own) and queues them for <see cref="DrainEvents"/>.
+        /// Called by <see cref="NetworkListener"/> for every received packet: enforces size, per-peer burst, and
+        /// global queue limits (evicting older unreliable packets before reliable ones), then copies bytes into a
+        /// pooled buffer for <see cref="DrainEvents"/>.
         /// </summary>
         internal void EnqueueReceived(NetPeer peer, NetDataReader reader, NetworkDelivery delivery)
         {
             int length = reader.AvailableBytes;
+            _peers.TryGetValue(peer.Id, out var peerState);
+            if (peerState is not null && peerState.InboundPollEpoch != _pollEpoch)
+            {
+                peerState.InboundPollEpoch = _pollEpoch;
+                peerState.InboundEventsInPoll = 0;
+                peerState.InboundUnreliableInPoll = 0;
+                peerState.InboundEvictCursor = 0;
+            }
+
+            if (length > Config.MaxReceivedPacketBytes || length > Config.MaxPendingEventBytes)
+            {
+                DroppedInboundEventCount++;
+                DroppedInboundBytes += length;
+                if (peerState is not null)
+                    peerState.DroppedInboundEvents++;
+                ReportInboundOverloadOnce(
+                    $"Received packet of {length} bytes exceeds inbound packet/byte limit ({Config.MaxReceivedPacketBytes}/{Config.MaxPendingEventBytes}).",
+                    peer.Id);
+                return;
+            }
+
+            bool isUnreliable = delivery == NetworkDelivery.Unreliable;
+
+            if (peerState is not null)
+            {
+                while (peerState.InboundEventsInPoll >= Config.MaxEventsPerPeerPerPoll)
+                {
+                    if (isUnreliable || !TryEvictOneUnreliableForPeer(peerState))
+                    {
+                        DroppedInboundEventCount++;
+                        DroppedInboundBytes += length;
+                        peerState.DroppedInboundEvents++;
+                        ReportInboundOverloadOnce(
+                            $"Peer {peer.Id} exceeded MaxEventsPerPeerPerPoll ({Config.MaxEventsPerPeerPerPoll}).",
+                            peer.Id);
+                        return;
+                    }
+                }
+            }
+            else if (_unknownPeerEventsInPoll >= Config.MaxEventsPerPeerPerPoll)
+            {
+                DroppedInboundEventCount++;
+                DroppedInboundBytes += length;
+                ReportInboundOverloadOnce(
+                    $"Unattached peer {peer.Id} exceeded MaxEventsPerPeerPerPoll ({Config.MaxEventsPerPeerPerPoll}).",
+                    peer.Id);
+                return;
+            }
+
+            while (_pendingPayloadEventCount >= Config.MaxPendingEvents
+                || _pendingEventBytes + length > Config.MaxPendingEventBytes)
+            {
+                if (isUnreliable || !TryEvictOneUnreliableGlobal())
+                {
+                    DroppedInboundEventCount++;
+                    DroppedInboundBytes += length;
+                    if (peerState is not null)
+                        peerState.DroppedInboundEvents++;
+                    ReportInboundOverloadOnce(
+                        $"Inbound queue exceeded limit ({Config.MaxPendingEvents} events / {Config.MaxPendingEventBytes} bytes).",
+                        peer.Id);
+                    return;
+                }
+            }
+
             byte[] buffer = RentPacketBuffer(length);
             reader.GetRemainingBytesSpan().CopyTo(buffer);
             _pending.Add(NetworkEvent.Received(peer, buffer, length, delivery));
+            _pendingPayloadEventCount++;
+            _pendingEventBytes += length;
+            if (_pendingPayloadEventCount > PeakPendingEventCount)
+                PeakPendingEventCount = _pendingPayloadEventCount;
+            if (_pendingEventBytes > PeakPendingEventBytes)
+                PeakPendingEventBytes = _pendingEventBytes;
+
+            if (peerState is not null)
+            {
+                peerState.InboundEventsInPoll++;
+                if (isUnreliable)
+                    peerState.InboundUnreliableInPoll++;
+            }
+            else
+            {
+                _unknownPeerEventsInPoll++;
+            }
         }
 
         /// <summary>Maximum allowed size in bytes for an unconnected datagram.</summary>
@@ -337,16 +529,48 @@ namespace Krut.Netcode
                 return;
             }
 
+            if (_unconnectedEventsInPoll >= Config.MaxUnconnectedEventsPerPoll
+                || _pendingPayloadEventCount >= Config.MaxPendingEvents
+                || _pendingEventBytes + length > Config.MaxPendingEventBytes)
+            {
+                DroppedInboundEventCount++;
+                DroppedInboundBytes += length;
+                ReportInboundOverloadOnce("Inbound unconnected queue limit exceeded.");
+                return;
+            }
+
             byte[] buffer = RentPacketBuffer(length);
             reader.GetRemainingBytesSpan().CopyTo(buffer);
             _pending.Add(NetworkEvent.Unconnected(endPoint, buffer, length));
+            _unconnectedEventsInPoll++;
+            _pendingPayloadEventCount++;
+            _pendingEventBytes += length;
+            if (_pendingPayloadEventCount > PeakPendingEventCount)
+                PeakPendingEventCount = _pendingPayloadEventCount;
+            if (_pendingEventBytes > PeakPendingEventBytes)
+                PeakPendingEventBytes = _pendingEventBytes;
+        }
+
+        /// <summary>Queues a socket error up to <see cref="NetworkConfig.MaxPendingEvents"/>.</summary>
+        internal void EnqueueSocketError(System.Net.IPEndPoint endPoint, SocketError error)
+        {
+            if (_pending.Count >= Config.MaxPendingEvents)
+            {
+                DroppedInboundEventCount++;
+                return;
+            }
+
+            _pending.Add(NetworkEvent.Socket(endPoint, error));
         }
 
         /// <summary>Gives the pooled receive buffers of queued events back to the pool.</summary>
-        private void ReleaseBuffers(List<NetworkEvent> events)
+        private void ReleaseBuffers(List<NetworkEvent> events) => ReleaseBuffersFrom(events, 0);
+
+        private void ReleaseBuffersFrom(List<NetworkEvent> events, int startIndex)
         {
-            foreach (var networkEvent in events)
+            for (int i = startIndex; i < events.Count; i++)
             {
+                var networkEvent = events[i];
                 if ((networkEvent.Kind == NetworkEventKind.Received || networkEvent.Kind == NetworkEventKind.Unconnected)
                     && networkEvent.Data is { } data)
                 {
@@ -399,15 +623,48 @@ namespace Krut.Netcode
             if (_disposed || !IsRunning)
                 return;
 
-            // Sent packets whose delay has expired go out BEFORE PollEvents, so that they get away in the same
-            // frame.
-            if (_delayQueue.FlushDue())
-                _unflushed = true;
-            Flush();
-            _manager.PollEvents();
-            DrainEvents();
-            _clock.Advance(deltaSeconds, _onTick);
-            Flush();
+            if (_inUpdate)
+            {
+                CallbackExceptionCount++;
+                ReportSafely(new NetworkError(
+                    NetworkErrorCode.CallbackException,
+                    "Re-entrant call to NetworkSession.Update() from inside a callback was ignored."));
+                return;
+            }
+
+            _inUpdate = true;
+            long updateStart = Stopwatch.GetTimestamp();
+            try
+            {
+                // Sent packets whose delay has expired go out BEFORE PollEvents, so that they get away in the same
+                // frame.
+                if (_delayQueue.FlushDue(_reportSafely))
+                    _unflushed = true;
+                Flush();
+
+                _pollEpoch++;
+                _unconnectedEventsInPoll = 0;
+                _unknownPeerEventsInPoll = 0;
+                _manager.PollEvents();
+                DrainEvents();
+
+                if (!_disposed && IsRunning)
+                {
+                    long tickStart = Stopwatch.GetTimestamp();
+                    _clock.Advance(deltaSeconds, _onTick);
+                    LastTickDurationMs = (Stopwatch.GetTimestamp() - tickStart) * 1000.0 / Stopwatch.Frequency;
+                    Flush();
+                }
+                else
+                {
+                    LastTickDurationMs = 0d;
+                }
+            }
+            finally
+            {
+                LastUpdateDurationMs = (Stopwatch.GetTimestamp() - updateStart) * 1000.0 / Stopwatch.Frequency;
+                _inUpdate = false;
+            }
         }
 
         /// <summary>
@@ -446,10 +703,15 @@ namespace Krut.Netcode
         /// <summary>
         /// Sends a message to a peer. Throws <see cref="InvalidOperationException"/> if a game message carries
         /// a <see cref="INetworkMessage.WireType"/> that was never registered (see
-        /// <see cref="GetWireTypeByte"/>).
+        /// <see cref="GetWireTypeByte"/>). Ownership of a rented message transfers to the session and it is
+        /// reset and recycled immediately (even if <paramref name="peerId"/> is unknown) — never access it
+        /// afterwards or pass the same rented instance to multiple <see cref="Send"/> calls (use
+        /// <see cref="Broadcast"/>, rent a fresh instance per call, or construct with <c>new</c>).
         /// </summary>
         public void Send(int peerId, INetworkMessage message)
         {
+            ArgumentNullException.ThrowIfNull(message);
+
             if (!_peers.TryGetValue(peerId, out var peer))
             {
                 Report(new NetworkError(NetworkErrorCode.PeerUnknown, $"Peer {peerId} does not exist (connection closed?).", peerId));
@@ -460,9 +722,15 @@ namespace Krut.Netcode
             SendInternal(peer, message);
         }
 
-        /// <summary>Sends a message to everyone except <paramref name="exceptPeerId"/> (-1 = everyone).</summary>
+        /// <summary>
+        /// Sends a message to everyone except <paramref name="exceptPeerId"/> (-1 = everyone). Ownership of a
+        /// rented message transfers to the session and it is reset and recycled immediately once serialization
+        /// completes (including when no peers are targeted) — never access it afterwards.
+        /// </summary>
         public void Broadcast(INetworkMessage message, int exceptPeerId = -1)
         {
+            ArgumentNullException.ThrowIfNull(message);
+
             int count = _peers.Count;
             if (count == 0)
             {
@@ -492,12 +760,13 @@ namespace Krut.Netcode
             }
 
             byte wireType = 0;
+            NetDataWriter? writer = null;
             try
             {
-                _writer.Reset();
+                writer = AcquireWriter();
                 wireType = GetWireTypeByte(message);
-                _writer.Put(wireType);
-                message.Write(_writer);
+                writer.Put(wireType);
+                message.Write(writer);
 
                 byte channel = message.Channel;
                 var delivery = message.Delivery;
@@ -508,11 +777,13 @@ namespace Krut.Netcode
                 {
                     var peer = targets[i];
                     targets[i] = null!;
-                    SendWriterToPeer(peer, _writer, delivery, deliveryMethod, channel, message.Type, simActive);
+                    SendWriterToPeer(peer, writer, delivery, deliveryMethod, channel, message.Type, simActive);
                 }
             }
             finally
             {
+                if (writer is not null)
+                    ReleaseWriter(writer);
                 Array.Clear(targets, 0, n);
                 _broadcastTargets = targets;
                 NetworkMessages.Recycle(message, wireType != 0 ? wireType : (message.Type != NetworkMessageType.None ? (byte)message.Type : message.WireType));
@@ -528,7 +799,11 @@ namespace Krut.Netcode
             NetworkMessages.Recycle(message, wireType);
         }
 
-        /// <summary>Rents a message from the pool (merges with the session's own handling - see <see cref="INetworkMessage"/>).</summary>
+        /// <summary>
+        /// Rents a message from the per-type pool. Ownership transfers back to the library as soon as the
+        /// instance is passed to <see cref="Send"/> or <see cref="Broadcast"/>; do not read or mutate it
+        /// afterwards.
+        /// </summary>
         public static T Rent<T>()
             where T : class, INetworkMessage, new()
             => NetworkMessagePool<T>.Rent();
@@ -554,6 +829,12 @@ namespace Krut.Netcode
             _peers.Clear();
             ReleaseBuffers(_pending);
             _pending.Clear();
+            _pendingPayloadEventCount = 0;
+            _pendingEventBytes = 0;
+            _pendingEvictCursor = 0;
+            _unconnectedEventsInPoll = 0;
+            _unknownPeerEventsInPoll = 0;
+            _writerInUse = false;
 
             // Queued packets are released: they would otherwise hold references to peers and byte arrays that
             // no longer mean anything.
@@ -611,10 +892,11 @@ namespace Krut.Netcode
         protected bool StartListener(string? address, int port)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            // LiteNetLib 2.x requires non-null addresses (unlike 1.x, where null meant "all"), so "all
-            // addresses" becomes explicitly IPAddress.Any.
-            var ipv4 = address is null ? System.Net.IPAddress.Any : System.Net.IPAddress.Parse(address);
-            return _manager.Start(ipv4, Config.IPv6Support ? System.Net.IPAddress.IPv6Any : ipv4, port);
+            if (address is null)
+                return _manager.Start(port);
+
+            var ipv4 = System.Net.IPAddress.Parse(address);
+            return _manager.Start(ipv4, System.Net.IPAddress.IPv6Any, port);
         }
 
         /// <summary>
@@ -669,14 +951,32 @@ namespace Krut.Netcode
         internal NetworkPeerState? RemovePeer(int peerId)
         {
             _delayQueue.RemovePeer(peerId);
-            if (!_peers.Remove(peerId, out var peer))
-                return null;
-
-            return peer;
+            return _peers.Remove(peerId, out var peer) ? peer : null;
         }
 
         /// <summary>Reports an error to the game (the library doesn't log network errors itself).</summary>
         internal void Report(NetworkError error) => Error?.Invoke(error);
+
+        private void ReportSafely(NetworkError error)
+        {
+            try
+            {
+                Error?.Invoke(error);
+            }
+            catch
+            {
+                // Never allow a faulty Error handler to abort queuing or event draining.
+            }
+        }
+
+        private void ReportCallbackException(Exception exception, int peerId = -1)
+        {
+            CallbackExceptionCount++;
+            ReportSafely(new NetworkError(
+                NetworkErrorCode.CallbackException,
+                $"Unhandled exception in session callback: {exception.Message}",
+                peerId));
+        }
 
         /// <summary>Sets the server's own values on a new peer (name from the handshake) - used by <see cref="NetworkServer"/>.</summary>
         internal void DescribePeer(NetworkPeerState peer, string name, int joinTick)
@@ -740,31 +1040,47 @@ namespace Krut.Netcode
             return wireType;
         }
 
+        private NetDataWriter AcquireWriter()
+        {
+            if (!_writerInUse)
+            {
+                _writerInUse = true;
+                _writer.Reset();
+                return _writer;
+            }
+
+            return new NetDataWriter(true, 256);
+        }
+
+        private void ReleaseWriter(NetDataWriter writer)
+        {
+            if (ReferenceEquals(writer, _writer))
+                _writerInUse = false;
+        }
+
         /// <summary>Writes and sends a message, and hands it back to the pool (it belongs to the session afterwards).</summary>
         private void SendInternal(NetworkPeerState peer, INetworkMessage message, bool recycle = true)
         {
             // The wire byte routes a game message back to its own pool; with 0 it would never be recycled.
             byte wireType = 0;
+            NetDataWriter? writer = null;
             try
             {
-                _writer.Reset();
+                writer = AcquireWriter();
                 wireType = GetWireTypeByte(message);
-                _writer.Put(wireType);
-                message.Write(_writer);
+                writer.Put(wireType);
+                message.Write(writer);
 
                 byte channel = message.Channel;
                 var delivery = message.Delivery;
-                SendWriterToPeer(
-                    peer,
-                    _writer,
-                    delivery,
-                    NetworkChannels.ToDeliveryMethod(delivery),
-                    channel,
-                    message.Type,
-                    _simulation is { IsActive: true });
+                var deliveryMethod = NetworkChannels.ToDeliveryMethod(delivery);
+                bool simActive = _simulation is { IsActive: true };
+                SendWriterToPeer(peer, writer, delivery, deliveryMethod, channel, message.Type, simActive);
             }
             finally
             {
+                if (writer is not null)
+                    ReleaseWriter(writer);
                 if (recycle)
                     NetworkMessages.Recycle(message, wireType != 0 ? wireType : (message.Type != NetworkMessageType.None ? (byte)message.Type : message.WireType));
             }
@@ -807,52 +1123,159 @@ namespace Krut.Netcode
         private void DrainEvents()
         {
             if (_pending.Count == 0)
-                return;
-
-            (_draining, _pending) = (_pending, _draining);
-            foreach (var networkEvent in _draining)
             {
-                switch (networkEvent.Kind)
-                {
-                    case NetworkEventKind.PeerConnected:
-                    {
-                        // If the peer is already in the list (the server put it there during the handshake) it
-                        // is reused, so that the peer object and the name stay together.
-                        var peer = _peers.TryGetValue(networkEvent.Peer!.Id, out var existing) ? existing : AddPeer(networkEvent.Peer!);
-                        OnPeerConnectedEvent(peer);
-                        PeerConnected?.Invoke(peer);
-                        break;
-                    }
-                    case NetworkEventKind.PeerDisconnected:
-                    {
-                        // A REJECTED connection arrives here without ever having been in the list: Skipping it
-                        // then would silence exactly what players need to hear - the server's explanation ("the
-                        // lobby is full", "update the game") is sent in that very event, and without it the
-                        // client stays in "connecting" until it times out. The name and id are filled in by the
-                        // server in the welcome message, which never came, so they are empty - and that is
-                        // correct: the connection never got that far.
-                        var peer = RemovePeer(networkEvent.Peer!.Id)
-                            ?? new NetworkPeerState(networkEvent.Peer);
-                        OnPeerDisconnectedEvent(peer, networkEvent.Disconnect);
-                        PeerDisconnected?.Invoke(peer, networkEvent.Disconnect);
-                        break;
-                    }
-                    case NetworkEventKind.Received:
-                        // Received packets are always handled directly: the simulation delays what a session
-                        // SENDS (see ApplySimulation), so a packet that arrives here has already waited out its
-                        // delay on the other side.
-                        HandleMessage(networkEvent);
-                        break;
-                    case NetworkEventKind.Unconnected:
-                        HandleUnconnected(networkEvent);
-                        break;
-                    case NetworkEventKind.SocketError:
-                        Report(new NetworkError(NetworkErrorCode.Socket, $"Network error: {networkEvent.Error}.", endPoint: networkEvent.EndPoint));
-                        break;
-                }
+                LastDrainedEventCount = 0;
+                return;
             }
 
-            _draining.Clear();
+            (_draining, _pending) = (_pending, _draining);
+            _pendingPayloadEventCount = 0;
+            _pendingEventBytes = 0;
+            _pendingEvictCursor = 0;
+
+            int nextIndex = 0;
+            int drained = 0;
+            int budget = Config.MaxEventsPerDrain;
+            try
+            {
+                while (nextIndex < _draining.Count)
+                {
+                    if (_disposed || !IsRunning)
+                        break;
+
+                    var networkEvent = _draining[nextIndex];
+                    if (networkEvent.Kind == NetworkEventKind.Dropped)
+                    {
+                        nextIndex++;
+                        continue;
+                    }
+
+                    if (budget > 0 && drained >= budget)
+                        break;
+
+                    // Advance before dispatching so HandleMessage/HandleUnconnected exclusively own buffer return
+                    // for this entry while finally only cleans up un-dispatched entries.
+                    nextIndex++;
+                    drained++;
+                    DispatchEventSafely(networkEvent);
+                }
+            }
+            finally
+            {
+                LastDrainedEventCount = drained;
+
+                if (_disposed || !IsRunning)
+                {
+                    ReleaseBuffersFrom(_draining, nextIndex);
+                    _draining.Clear();
+                }
+                else if (nextIndex < _draining.Count)
+                {
+                    // MaxEventsPerDrain reached: preserve deferred events in FIFO order ahead of any events
+                    // appended to _pending during callbacks.
+                    _draining.RemoveRange(0, nextIndex);
+
+                    int deferredPayloadCount = 0;
+                    long deferredBytes = 0;
+                    for (int i = 0; i < _draining.Count; i++)
+                    {
+                        var deferred = _draining[i];
+                        if (deferred.Kind == NetworkEventKind.Received || deferred.Kind == NetworkEventKind.Unconnected)
+                        {
+                            deferredPayloadCount++;
+                            deferredBytes += deferred.Length;
+                        }
+                    }
+
+                    _pendingPayloadEventCount += deferredPayloadCount;
+                    _pendingEventBytes += deferredBytes;
+                    if (_pendingPayloadEventCount > PeakPendingEventCount)
+                        PeakPendingEventCount = _pendingPayloadEventCount;
+                    if (_pendingEventBytes > PeakPendingEventBytes)
+                        PeakPendingEventBytes = _pendingEventBytes;
+
+                    if (_pending.Count > 0)
+                    {
+                        _draining.AddRange(_pending);
+                        _pending.Clear();
+                    }
+
+                    (_pending, _draining) = (_draining, _pending);
+                    _pendingEvictCursor = 0;
+                }
+                else
+                {
+                    _draining.Clear();
+                }
+            }
+        }
+
+        private void DispatchEventSafely(in NetworkEvent networkEvent)
+        {
+            switch (networkEvent.Kind)
+            {
+                case NetworkEventKind.PeerConnected:
+                {
+                    // If the peer is already in the list (the server put it there during the handshake) it
+                    // is reused, so that the peer object and the name stay together.
+                    var peer = _peers.TryGetValue(networkEvent.Peer!.Id, out var existing) ? existing : AddPeer(networkEvent.Peer!);
+                    InvokePeerConnectedIsolated(peer);
+                    break;
+                }
+                case NetworkEventKind.PeerDisconnected:
+                {
+                    // A REJECTED connection arrives here without ever having been in the list: Skipping it
+                    // then would silence exactly what players need to hear - the server's explanation ("the
+                    // lobby is full", "update the game") is sent in that very event, and without it the
+                    // client stays in "connecting" until it times out. The name and id are filled in by the
+                    // server in the welcome message, which never came, so they are empty - and that is
+                    // correct: the connection never got that far.
+                    var peer = RemovePeer(networkEvent.Peer!.Id)
+                        ?? new NetworkPeerState(networkEvent.Peer);
+                    try
+                    {
+                        OnPeerDisconnectedEvent(peer, networkEvent.Disconnect);
+                    }
+                    catch (Exception exception)
+                    {
+                        ReportCallbackException(exception, peer.Id);
+                    }
+
+                    if (!_disposed)
+                    {
+                        try
+                        {
+                            PeerDisconnected?.Invoke(peer, networkEvent.Disconnect);
+                        }
+                        catch (Exception exception)
+                        {
+                            ReportCallbackException(exception, peer.Id);
+                        }
+                    }
+                    break;
+                }
+                case NetworkEventKind.Received:
+                    // Received packets are always handled directly: the simulation delays what a session
+                    // SENDS (see ApplySimulation), so a packet that arrives here has already waited out its
+                    // delay on the other side.
+                    HandleMessage(networkEvent);
+                    break;
+                case NetworkEventKind.Unconnected:
+                    HandleUnconnected(networkEvent);
+                    break;
+                case NetworkEventKind.SocketError:
+                    try
+                    {
+                        Report(new NetworkError(NetworkErrorCode.Socket, $"Network error: {networkEvent.Error}.", endPoint: networkEvent.EndPoint));
+                    }
+                    catch (Exception exception)
+                    {
+                        ReportCallbackException(exception);
+                    }
+                    break;
+                case NetworkEventKind.Dropped:
+                    break;
+            }
         }
 
         private void HandleUnconnected(NetworkEvent networkEvent)
@@ -865,7 +1288,14 @@ namespace Krut.Netcode
 
                 byte[] copy = new byte[networkEvent.Length];
                 Buffer.BlockCopy(networkEvent.Data!, 0, copy, 0, networkEvent.Length);
-                handler.Invoke(networkEvent.EndPoint!, copy);
+                try
+                {
+                    handler.Invoke(networkEvent.EndPoint!, copy);
+                }
+                catch (Exception exception)
+                {
+                    ReportCallbackException(exception);
+                }
             }
             finally
             {
@@ -885,6 +1315,30 @@ namespace Krut.Netcode
             }
         }
 
+        private void InvokePeerConnectedIsolated(NetworkPeerState peer)
+        {
+            try
+            {
+                OnPeerConnectedEvent(peer);
+            }
+            catch (Exception exception)
+            {
+                ReportCallbackException(exception, peer.Id);
+            }
+
+            if (!_disposed && IsRunning)
+            {
+                try
+                {
+                    PeerConnected?.Invoke(peer);
+                }
+                catch (Exception exception)
+                {
+                    ReportCallbackException(exception, peer.Id);
+                }
+            }
+        }
+
         private void DecodeAndDeliver(NetworkEvent networkEvent)
         {
             var reader = _reader;
@@ -894,9 +1348,15 @@ namespace Krut.Netcode
             if (!reader.TryGetByte(out typeByte))
             {
                 MalformedMessageCount++;
-                Report(new NetworkError(NetworkErrorCode.MalformedMessage, "Empty message received.", networkEvent.Peer!.Id));
+                ReportSafely(new NetworkError(NetworkErrorCode.MalformedMessage, "Empty message received.", networkEvent.Peer!.Id));
                 return;
             }
+
+            DecodeMessageBody(networkEvent, reader, typeByte);
+        }
+
+        private void DecodeMessageBody(NetworkEvent networkEvent, NetDataReader reader, byte typeByte)
+        {
 
             // Look it up by the RAW byte, not by the enum: a game project has registered its own message types
             // on bytes 16-255 (see NetworkMessages.RegisterGameMessage), and they have no values in
@@ -909,7 +1369,7 @@ namespace Krut.Netcode
                 // Either a newer-version client or a broken header. It is reported, but the connection is kept:
                 // a message this side doesn't understand must not kick a player out of a match in progress.
                 UnknownMessageCount++;
-                Report(new NetworkError(NetworkErrorCode.UnknownMessageType, $"Unknown message type {typeByte}.", networkEvent.Peer!.Id));
+                ReportSafely(new NetworkError(NetworkErrorCode.UnknownMessageType, $"Unknown message type {typeByte}.", networkEvent.Peer!.Id));
                 return;
             }
 
@@ -919,7 +1379,7 @@ namespace Krut.Netcode
             {
                 NetworkMessages.Recycle(message, typeByte);
                 MalformedMessageCount++;
-                Report(new NetworkError(NetworkErrorCode.MalformedMessage, $"Client sent a server-only message type {typeByte}.", networkEvent.Peer!.Id));
+                ReportSafely(new NetworkError(NetworkErrorCode.MalformedMessage, $"Client sent a server-only message type {typeByte}.", networkEvent.Peer!.Id));
                 return;
             }
 
@@ -933,7 +1393,7 @@ namespace Krut.Netcode
                 // sender wrote (bit error or a client with a different protocol build).
                 NetworkMessages.Recycle(message, typeByte);
                 MalformedMessageCount++;
-                Report(new NetworkError(NetworkErrorCode.MalformedMessage, $"Could not decode message type {typeByte} - packet too short.", networkEvent.Peer!.Id));
+                ReportSafely(new NetworkError(NetworkErrorCode.MalformedMessage, $"Could not decode message type {typeByte} - packet too short.", networkEvent.Peer!.Id));
                 return;
             }
 
@@ -941,7 +1401,7 @@ namespace Krut.Netcode
             {
                 NetworkMessages.Recycle(message, typeByte);
                 MalformedMessageCount++;
-                Report(new NetworkError(NetworkErrorCode.MalformedMessage, $"Could not decode message type {typeByte} - {reader.AvailableBytes} trailing bytes remained.", networkEvent.Peer!.Id));
+                ReportSafely(new NetworkError(NetworkErrorCode.MalformedMessage, $"Could not decode message type {typeByte} - {reader.AvailableBytes} trailing bytes remained.", networkEvent.Peer!.Id));
                 return;
             }
 
@@ -955,6 +1415,10 @@ namespace Krut.Netcode
             try
             {
                 handler.Invoke(new NetworkEnvelope(networkEvent.Peer!.Id, message, networkEvent.Delivery, Time));
+            }
+            catch (Exception exception)
+            {
+                ReportCallbackException(exception, networkEvent.Peer!.Id);
             }
             finally
             {
